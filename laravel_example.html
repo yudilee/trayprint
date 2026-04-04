@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trayprint Local Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 2rem; max-width: 600px; margin: 0 auto; background: #f4f4f5; }
+        .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .hidden { display: none; }
+        .danger { color: #dc2626; font-weight: bold; }
+        .success { color: #16a34a; font-weight: bold; }
+        select, button, textarea { width: 100%; padding: 0.5rem; margin-top: 0.5rem; margin-bottom: 1rem; border: 1px solid #ddd; border-radius: 4px; }
+        button { background: #2563eb; color: white; border: none; cursor: pointer; font-weight: bold; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #94a3b8; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>Direct Local Print Test</h2>
+    <div id="status-box">
+        <p>Checking for local print service...</p>
+    </div>
+
+    <div id="print-form" class="hidden">
+        <p class="success">✓ Print Service Connected</p>
+        
+        <label for="printerSelect">Select Printer</label>
+        <select id="printerSelect">
+            <option>Loading printers...</option>
+        </select>
+
+        <label for="dataInput">Raw Data / Text to Print</label>
+        <textarea id="dataInput" rows="5">Hello, this is a test print!
+This goes directly to the spooler.</textarea>
+
+        <button id="printBtn">Print Now</button>
+        <p id="printResult"></p>
+    </div>
+</div>
+
+<script>
+    const PORT = 49211;
+    const API_URL = `http://127.0.0.1:${PORT}`;
+    
+    const statusBox = document.getElementById('status-box');
+    const printForm = document.getElementById('print-form');
+    const printerSelect = document.getElementById('printerSelect');
+    const printBtn = document.getElementById('printBtn');
+    const printResult = document.getElementById('printResult');
+
+    // 1. Detect if the service is running
+    fetch(`${API_URL}/status`)
+        .then(res => {
+            if (res.ok) {
+                statusBox.classList.add('hidden');
+                printForm.classList.remove('hidden');
+                loadPrinters();
+            }
+        })
+        .catch(err => {
+            statusBox.innerHTML = `
+                <p class="danger">✗ Print Service is not running.</p>
+                <p>Please ensure the Trayprint application is open in your system tray.</p>
+            `;
+        });
+
+    // 2. Load printers
+    function loadPrinters() {
+        fetch(`${API_URL}/printers`)
+            .then(res => res.json())
+            .then(data => {
+                printerSelect.innerHTML = ''; // clear
+                if (data.printers && data.printers.length > 0) {
+                    data.printers.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p;
+                        opt.textContent = p;
+                        printerSelect.appendChild(opt);
+                    });
+                } else {
+                    const opt = document.createElement('option');
+                    opt.textContent = 'No printers found';
+                    printerSelect.appendChild(opt);
+                    printBtn.disabled = true;
+                }
+            })
+            .catch(err => console.error("Error loading printers", err));
+    }
+
+    // 3. Send Print Job
+    printBtn.addEventListener('click', () => {
+        const printer = printerSelect.value;
+        const rawData = document.getElementById('dataInput').value;
+
+        printBtn.disabled = true;
+        printBtn.textContent = "Printing...";
+        printResult.textContent = "";
+
+        fetch(`${API_URL}/print`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ printer: printer, data: rawData })
+        })
+        .then(res => res.json())
+        .then(data => {
+            printBtn.disabled = false;
+            printBtn.textContent = "Print Now";
+            if (data.status === 'success') {
+                printResult.className = "success";
+                printResult.textContent = "✓ Successfully sent to printer spooler.";
+            } else {
+                printResult.className = "danger";
+                printResult.textContent = "✗ Error: " + data.error;
+            }
+        })
+        .catch(err => {
+            printBtn.disabled = false;
+            printBtn.textContent = "Print Now";
+            printResult.className = "danger";
+            printResult.textContent = "✗ Network Error sending print job.";
+        });
+    });
+</script>
+
+</body>
+</html>

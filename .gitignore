@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+venv/
+ENV/
+env/
+.env
+
+# PyInstaller
+#  Often these folders are used by PyInstaller to store temporary files
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+trayprint.log
+
+# IDEs
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

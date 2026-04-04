@@ -1,0 +1,13 @@
+{
+  "port": 49211,
+  "allowed_origins": [
+    "*"
+  ],
+  "hub_url": "http://127.0.0.1:8082",
+  "agent_key": "vSSnGL2OjersI0SArxwHq5yc0l93JvFM",
+  "autostart": false,
+  "log_file": "trayprint.log",
+  "max_job_history": 50,
+  "sync_interval_seconds": 60,
+  "profiles": []
+}
