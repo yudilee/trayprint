@@ -88,24 +88,56 @@ def _build_lp_options(options):
     if not options:
         return args
 
+    # 1. Basic Options
     copies = options.get('copies')
     if copies and int(copies) > 1:
         args += ['-n', str(int(copies))]
 
+    # 2. Paper Size & Custom Dimensions
     paper = options.get('paper_size')
-    if paper:
+    width_mm = options.get('paper_width_mm')
+    height_mm = options.get('paper_height_mm')
+    
+    if width_mm and height_mm:
+        # Custom size is the best for continuous forms / labels
+        args += ['-o', f'media=Custom.{width_mm}x{height_mm}mm']
+    elif paper:
+        # Standard size name
         args += ['-o', f'media={paper}']
 
+    # 3. Orientation (3=Portrait, 4=Landscape)
     orientation = options.get('orientation')
     if orientation == 'landscape':
         args += ['-o', 'orientation-requested=4']
+    else:
+        args += ['-o', 'orientation-requested=3']
 
+    # 4. Margins (Convert mm to Points: 1mm = 2.83465 pts)
+    m_top = options.get('margin_top', 0)
+    m_bottom = options.get('margin_bottom', 0)
+    m_left = options.get('margin_left', 0)
+    m_right = options.get('margin_right', 0)
+    
+    if any([m_top, m_bottom, m_left, m_right]):
+        args += [
+            '-o', f'page-top={int(float(m_top) * 2.83465)}',
+            '-o', f'page-bottom={int(float(m_bottom) * 2.83465)}',
+            '-o', f'page-left={int(float(m_left) * 2.83465)}',
+            '-o', f'page-right={int(float(m_right) * 2.83465)}'
+        ]
+
+    # 4b. Fit to Page
+    if options.get('fit_to_page') or any([m_top, m_bottom, m_left, m_right]):
+        args += ['-o', 'fit-to-page']
+
+    # 5. Duplex
     duplex = options.get('duplex')
     if duplex == 'two-sided-long':
         args += ['-o', 'sides=two-sided-long-edge']
     elif duplex == 'two-sided-short':
         args += ['-o', 'sides=two-sided-short-edge']
 
+    # 6. Page Range
     page_range = options.get('page_range')
     if page_range:
         args += ['-o', f'page-ranges={page_range}']
@@ -126,6 +158,13 @@ def _build_sumatra_options(options):
     orientation = options.get('orientation')
     if orientation == 'landscape':
         parts.append('landscape')
+    else:
+        parts.append('portrait')
+
+    # paper size (Sumatra only supports names, not mm dimensions via CLI)
+    paper = options.get('paper_size')
+    if paper:
+        parts.append(f'paper={paper}')
 
     duplex = options.get('duplex')
     if duplex and duplex.startswith('two-sided'):
@@ -134,6 +173,10 @@ def _build_sumatra_options(options):
     page_range = options.get('page_range')
     if page_range:
         parts.append(page_range)
+
+    # Scaling / Fit to page (Sumatra uses 'shrink' or 'fit')
+    if options.get('fit_to_page'):
+        parts.append('fit')
 
     if parts:
         return ['-print-settings', ','.join(parts)]
@@ -162,8 +205,44 @@ def print_raw(printer_name, data_str, options=None):
     if is_windows():
         try:
             import win32print
+            import win32con
+            
+            # Open printer with write access
             hprinter = win32print.OpenPrinter(printer_name)
             try:
+                # If we have custom size options, try to set the DevMode
+                if options and (options.get('paper_width_mm') or options.get('paper_height_mm') or options.get('orientation')):
+                    try:
+                        # Get default DevMode
+                        pinfo = win32print.GetPrinter(hprinter, 2)
+                        devmode = pinfo['pDevMode']
+                        
+                        modified = False
+                        # Orientation (1=Portrait, 2=Landscape)
+                        if options.get('orientation') == 'landscape':
+                            devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                            modified = True
+                        elif options.get('orientation') == 'portrait':
+                            devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                            modified = True
+
+                        # Paper Size (Width/Height in 0.1mm units)
+                        w = options.get('paper_width_mm')
+                        h = options.get('paper_height_mm')
+                        if w and h:
+                            devmode.PaperSize = 0 # Custom
+                            devmode.PaperWidth = int(float(w) * 10)
+                            devmode.PaperLength = int(float(h) * 10)
+                            devmode.Fields |= (win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
+                            modified = True
+                        
+                        if modified:
+                            # Update printer settings for this session
+                            win32print.DocumentProperties(0, hprinter, printer_name, devmode, devmode, win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER)
+                    except Exception as de:
+                        log.warning("Could not set Windows DevMode: %s", de)
+
+                # Send the print job
                 hjob = win32print.StartDocPrinter(hprinter, 1, ("Raw Web Print Job", None, "RAW"))
                 try:
                     win32print.StartPagePrinter(hprinter)

@@ -29,6 +29,9 @@ def build():
         '--hidden-import=flask',
         '--hidden-import=requests',
         '--hidden-import=PIL',
+        '--hidden-import=win32print',
+        '--hidden-import=win32con',
+        '--hidden-import=win32api',
     ]
 
     # Data files to include inside the bundle (read-only templates/icons)
