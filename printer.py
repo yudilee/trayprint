@@ -698,24 +698,59 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                                 img_w, img_h = img.size
                                 log.info("Scaled to %dx%d (scale=%.3f)", img_w, img_h, scale)
 
-                        # Convert to BMP bytes for win32ui bitmap
-                        bmp_buf = io.BytesIO()
-                        img.save(bmp_buf, format="BMP")
-                        bmp_bytes = bmp_buf.getvalue()
+                        # Send image to printer using StretchDIBits (no bitmap object needed)
+                        # StretchDIBits sends raw pixel bytes directly to the printer HDC.
+                        import ctypes
+                        import ctypes.wintypes
 
-                        # Create compatible memory DC + bitmap, BitBlt to printer
-                        mem_dc = dc.CreateCompatibleDC()
-                        bmp = win32ui.CreateBitmap()
-                        bmp.CreateBitmapFromBmpData(bmp_bytes)
-                        old_bmp = mem_dc.SelectObject(bmp)
+                        # PIL raw bytes: RGB, 3 bytes per pixel, rows top-to-bottom
+                        raw_pixels = img.tobytes()  # RGB, top-down
+
+                        # Build BITMAPINFOHEADER
+                        class BITMAPINFOHEADER(ctypes.Structure):
+                            _fields_ = [
+                                ('biSize',          ctypes.c_uint32),
+                                ('biWidth',         ctypes.c_int32),
+                                ('biHeight',        ctypes.c_int32),   # negative = top-down
+                                ('biPlanes',        ctypes.c_uint16),
+                                ('biBitCount',      ctypes.c_uint16),
+                                ('biCompression',   ctypes.c_uint32),
+                                ('biSizeImage',     ctypes.c_uint32),
+                                ('biXPelsPerMeter', ctypes.c_int32),
+                                ('biYPelsPerMeter', ctypes.c_int32),
+                                ('biClrUsed',       ctypes.c_uint32),
+                                ('biClrImportant',  ctypes.c_uint32),
+                            ]
+
+                        bmi = BITMAPINFOHEADER()
+                        bmi.biSize          = ctypes.sizeof(BITMAPINFOHEADER)
+                        bmi.biWidth         = img_w
+                        bmi.biHeight        = -img_h   # negative = top-down (matches PIL order)
+                        bmi.biPlanes        = 1
+                        bmi.biBitCount      = 24       # RGB
+                        bmi.biCompression   = 0        # BI_RGB
+                        bmi.biSizeImage     = 0
+                        bmi.biXPelsPerMeter = int(dpi_x / 0.0254)
+                        bmi.biYPelsPerMeter = int(dpi_y / 0.0254)
+                        bmi.biClrUsed       = 0
+                        bmi.biClrImportant  = 0
+
+                        hdc = dc.GetSafeHdc()
+                        SRCCOPY    = 0x00CC0020
+                        DIB_RGB_COLORS = 0
 
                         dc.StartPage()
-                        dc.BitBlt((0, 0), (img_w, img_h), mem_dc, (0, 0), win32con.SRCCOPY)
+                        result = ctypes.windll.gdi32.StretchDIBits(
+                            hdc,
+                            0, 0, img_w, img_h,      # destination rect
+                            0, 0, img_w, img_h,      # source rect
+                            raw_pixels,               # pixel data
+                            ctypes.byref(bmi),        # bitmap info
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        )
                         dc.EndPage()
-
-                        mem_dc.SelectObject(old_bmp)
-                        mem_dc.DeleteDC()
-                        bmp.DeleteObject()
+                        log.info("StretchDIBits result: %s (lines transferred)", result)
 
                 dc.EndDoc()
                 doc.close()
