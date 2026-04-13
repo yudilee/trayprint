@@ -553,17 +553,25 @@ def _create_devmode_for_options(printer_name, options):
             
             # Set paper size by ID if found (e.g., custom "kuitansi" form)
             if paper_id:
-                # When we have a matched form from the driver's DC_PAPERS list,
-                # ONLY set PaperSize. The form already defines the correct dimensions.
-                # Setting PaperWidth/PaperLength/Orientation explicitly can cause
-                # SumatraPDF to auto-rotate content incorrectly on dot-matrix printers.
+                # Set form ID + explicit dimensions matching the form.
+                # We MUST set W/H because the default DevMode has A4 values (2100x2970)
+                # and SumatraPDF uses those DC dimensions for auto-rotation decisions.
+                # By setting W=2413, H=1397 the DC is landscape-shaped (wider than tall)
+                # which matches the landscape PDF → SumatraPDF won't auto-rotate.
                 devmode.PaperSize = paper_id
                 devmode.Fields |= win32con.DM_PAPERSIZE
-                # Clear dimension/orientation flags to let the form definition control them
-                devmode.Fields &= ~(win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH | win32con.DM_ORIENTATION)
+                
+                if w_mm and h_mm:
+                    devmode.PaperWidth = int(float(w_mm) * 10)
+                    devmode.PaperLength = int(float(h_mm) * 10)
+                    devmode.Fields |= (win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
+                
+                # CLEAR orientation flag — let the form shape control layout,  
+                # not an explicit portrait/landscape flag that SumatraPDF uses to decide rotation
+                devmode.Fields &= ~win32con.DM_ORIENTATION
                 modified = True
-                log.info("DevMode: Set PaperSize ID=%d (%s) — form controls dimensions/orientation",
-                         paper_id, paper_name)
+                log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d — orientation flag cleared",
+                         paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
             else:
                 if w_mm and h_mm:
                     # No matching form found — use DMPAPER_USER with explicit dimensions
@@ -588,8 +596,9 @@ def _create_devmode_for_options(printer_name, options):
             
             if modified:
                 if paper_id:
-                    log.info("DevMode ready (form-only, no validation). PaperSize=%s, W=%s, H=%s, Orient=%s",
-                             devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength, devmode.Orientation)
+                    log.info("DevMode ready (no validation). PaperSize=%s, W=%s, H=%s, Orient=%s, Fields=%s",
+                             devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength, 
+                             devmode.Orientation, devmode.Fields)
                 else:
                     # For generic custom sizes, validate through DocumentProperties
                     result = win32print.DocumentProperties(
