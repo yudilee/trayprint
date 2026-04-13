@@ -233,6 +233,8 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
 def report_status_to_hub(hub_url, agent_key):
     """Report local status (printers) to the central hub."""
     import requests
+    if not hub_url:
+        return
     try:
         headers = {'Authorization': f'Bearer {agent_key}',
                    'Content-Type': 'application/json'}
@@ -244,10 +246,14 @@ def report_status_to_hub(hub_url, agent_key):
         payload = {
             'printers': [p['name'] for p in printers_list]
         }
-        requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
+        resp = requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
         global _hub_last_status
-        _hub_last_status = "Connected"
-        log.info("Reported %d printers to hub", len(printers_list))
+        if resp.status_code == 200:
+            _hub_last_status = "Connected"
+            log.info("Reported %d printers to hub", len(printers_list))
+        else:
+            _hub_last_status = f"Offline ({resp.status_code})"
+            log.warning("Hub rejected status report (HTTP %d): %s", resp.status_code, resp.text)
     except Exception as e:
         _hub_last_status = "Offline"
         log.debug("Failed to report status to hub: %s", e)
@@ -639,7 +645,8 @@ def run_server(port):
     
     # Perform an initial printer check to populate the cache
     try:
-        report_status_to_hub("", "") # Passing empty hub to just trigger the local cache update
+        # Pre-populate printer list for the local UI even without hub
+        printer.get_printers()
     except:
         pass
 
