@@ -174,7 +174,7 @@ def _find_windows_paper_name(printer_name, w_mm, h_mm):
     and returns the name of the one matching the given width/height.
     """
     if not is_windows() or not printer_name:
-        return None
+        return None, None
     try:
         import win32print
         import win32con
@@ -183,25 +183,56 @@ def _find_windows_paper_name(printer_name, w_mm, h_mm):
         sizes = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERSIZE)
         ids = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERS)
         
+        if not names or not sizes or not ids:
+            log.debug("DeviceCapabilities returned empty for %s", printer_name)
+            return None, None
+        
+        # Log all available paper sizes for debugging
+        log.info("Printer '%s' has %d paper sizes available", printer_name, len(names))
+        for i, name in enumerate(names):
+            if i < len(sizes) and i < len(ids):
+                s = sizes[i]
+                # sizes can be tuples (w,h) or individual values - handle both
+                if isinstance(s, (list, tuple)):
+                    sw, sh = int(s[0]), int(s[1])
+                else:
+                    sw, sh = 0, 0
+                log.debug("  Paper[%d]: '%s' ID=%s size=%dx%d", i, name.strip() if isinstance(name, str) else name, ids[i], sw, sh)
+        
         # sizes are in 0.1mm units. 
         # Example: 210mm = 2100 units
         target_w = int(float(w_mm) * 10)
         target_h = int(float(h_mm) * 10)
         
-        for i, (w, h) in enumerate(sizes):
-            # Use a tolerance of 2 units (0.2mm)
-            if abs(w - target_w) <= 2 and abs(h - target_h) <= 2:
-                log.info("Matched Windows paper size by dimensions: %s (ID:%d) (%dx%d)", names[i], ids[i], w, h)
-                return names[i], ids[i]
+        for i, s in enumerate(sizes):
+            if i >= len(names) or i >= len(ids):
+                break
+            # Handle both tuple and other formats
+            if isinstance(s, (list, tuple)):
+                w, h = int(s[0]), int(s[1])
+            else:
+                continue
+            # Use a tolerance of 5 units (0.5mm)
+            if abs(w - target_w) <= 5 and abs(h - target_h) <= 5:
+                name = names[i].strip() if isinstance(names[i], str) else str(names[i])
+                log.info("Matched Windows paper size by dimensions: '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
+                return name, int(ids[i])
         
         # Try swapped dimensions for orientation-agnostic drivers
-        for i, (w, h) in enumerate(sizes):
-            if abs(h - target_w) <= 2 and abs(w - target_h) <= 2:
-                log.info("Matched Windows paper size by swapped dimensions: %s (ID:%d) (%dx%d)", names[i], ids[i], w, h)
-                return names[i], ids[i]
+        for i, s in enumerate(sizes):
+            if i >= len(names) or i >= len(ids):
+                break
+            if isinstance(s, (list, tuple)):
+                w, h = int(s[0]), int(s[1])
+            else:
+                continue
+            if abs(h - target_w) <= 5 and abs(w - target_h) <= 5:
+                name = names[i].strip() if isinstance(names[i], str) else str(names[i])
+                log.info("Matched Windows paper size by swapped dimensions: '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
+                return name, int(ids[i])
                 
     except Exception as e:
-        log.debug("Error finding Windows paper name: %s", e)
+        log.warning("Error finding Windows paper name: %s", e, exc_info=True)
     return None, None
 
 
@@ -310,7 +341,7 @@ def _build_sumatra_options(options, printer_name=None):
         if matched_name:
             paper = matched_name
 
-    if paper:
+    if paper and paper.upper() != 'CUSTOM':
         # Fallback mappings for common names that vary between Linux/Windows
         # Example: Hub/Linux says "Half Letter", Windows driver says "Statement"
         mappings = {
@@ -476,6 +507,12 @@ def _create_devmode_for_options(printer_name, options):
                 devmode.Fields |= win32con.DM_PAPERSIZE
                 modified = True
                 log.info("DevMode: Set PaperSize ID=%d (%s)", paper_id, paper_name)
+            elif w_mm and h_mm:
+                # No matching form found — use DMPAPER_USER (256) for custom size
+                devmode.PaperSize = 256  # DMPAPER_USER
+                devmode.Fields |= win32con.DM_PAPERSIZE
+                modified = True
+                log.info("DevMode: Set PaperSize to DMPAPER_USER (256) — no matching form found")
             
             # Always set explicit dimensions for custom/dot-matrix
             if w_mm and h_mm:
