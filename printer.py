@@ -656,8 +656,14 @@ def print_pdf(printer_name, pdf_base64, options=None):
                             
                             try:
                                 # SumatraPDF will now use the printer's default (which we just set)
+                                # Don't pass orientation/paper to SumatraPDF — DevMode handles it.
+                                # Only pass non-layout options like fit, copies, etc.
                                 cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
-                                cmd += _build_sumatra_options(options, printer_name)
+                                sumatra_parts = []
+                                if options.get('fit_to_page'):
+                                    sumatra_parts.append('fit')
+                                if sumatra_parts:
+                                    cmd += ['-print-settings', ','.join(sumatra_parts)]
                                 cmd.append(temp_path)
                                 log.info("SumatraPDF cmd: %s", ' '.join(cmd))
                                 subprocess.run(cmd, check=True, timeout=60)
