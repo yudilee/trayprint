@@ -671,9 +671,7 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                 doc = fitz.open(pdf_path)
                 copies = max(1, int(options.get('copies', 1)) if options else 1)
 
-                doc_info = win32ui.DOCINFO()
-                doc_info['szDocName'] = 'PrintHub Job'
-                dc.StartDoc(doc_info)
+                dc.StartDoc('PrintHub Job')
 
                 total_pages = len(doc)
                 for copy_idx in range(copies):
