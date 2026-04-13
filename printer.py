@@ -674,72 +674,52 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         page = doc[page_num]
 
                         # ── Margins: convert mm → pixels ──
-                        # options margins are in mm; convert to printer pixels
                         mm_to_px_x = dpi_x / 25.4
                         mm_to_px_y = dpi_y / 25.4
                         margin_l = int((options.get('margin_left',   0) or 0) * mm_to_px_x) if options else 0
                         margin_r = int((options.get('margin_right',  0) or 0) * mm_to_px_x) if options else 0
                         margin_t = int((options.get('margin_top',    0) or 0) * mm_to_px_y) if options else 0
                         margin_b = int((options.get('margin_bottom', 0) or 0) * mm_to_px_y) if options else 0
+                        avail_w = max((pwidth_px  - 2 * offset_x) - margin_l - margin_r, 1)
+                        avail_h = max((pheight_px - 2 * offset_y) - margin_t - margin_b, 1)
 
-                        # Printable area minus margins
-                        avail_w = (pwidth_px - 2 * offset_x) - margin_l - margin_r
-                        avail_h = (pheight_px - 2 * offset_y) - margin_t - margin_b
-                        avail_w = max(avail_w, 1)
-                        avail_h = max(avail_h, 1)
-
-                        # ── Render at printer's exact DPI per axis ──
-                        # The DC may have asymmetric DPI (e.g. 360x180 for LQ-2180).
-                        # Render using fitz.Matrix(dpi_x/72, dpi_y/72) so the rendered
-                        # image pixels map 1:1 to the printer DC with no aspect distortion.
-                        # If an axis is < 200dpi, supersample it 2x for better text quality.
-                        ss_x = 2 if dpi_x < 200 else 1
-                        ss_y = 2 if dpi_y < 200 else 1
-                        render_dpi_x = dpi_x * ss_x
-                        render_dpi_y = dpi_y * ss_y
-                        mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
+                        # ── Render at fixed 360dpi (square pixels, good quality) ──
+                        # Always render at 360dpi regardless of actual printer DPI.
+                        # StretchDIBits fills the exact DC area, handling any DPI config:
+                        # 180x180, 360x180, 360x360, 600dpi — all work without code changes.
+                        RENDER_DPI = 360
+                        mat = fitz.Matrix(RENDER_DPI / 72.0, RENDER_DPI / 72.0)
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
                         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                         img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d @ %dx%d dpi (DC=%dx%d, ss=%dx%d)",
-                                 copy_idx + 1, page_num + 1, img_w, img_h,
-                                 render_dpi_x, render_dpi_y, dpi_x, dpi_y, ss_x, ss_y)
+                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi, DC=%dx%d dpi, avail=%dx%d px",
+                                 copy_idx + 1, page_num + 1, img_w, img_h, RENDER_DPI,
+                                 dpi_x, dpi_y, avail_w, avail_h)
 
                         # ── Orientation: rotate page to match DC shape ──
                         # Compare rendered PDF shape against the printer DC shape.
                         # If they already match (both landscape or both portrait), do nothing.
                         # Only rotate if they differ.
-                        # NOTE: Do NOT use the orientation option string here — for kuitansi,
-                        # the profile says 'portrait' but both PDF and DC are landscape-shaped.
-                        dc_is_landscape  = pwidth_px > pheight_px
+                        dc_is_landscape   = pwidth_px > pheight_px
                         page_is_landscape = img_w > img_h
                         if dc_is_landscape and not page_is_landscape:
-                            # DC is landscape but PDF page is portrait → rotate CW 90°
                             img = img.rotate(-90, expand=True)
                             img_w, img_h = img.size
                             log.info("Rotated CW 90° (DC=landscape, page=portrait)")
                         elif not dc_is_landscape and page_is_landscape:
-                            # DC is portrait but PDF page is landscape → rotate CCW 90°
                             img = img.rotate(90, expand=True)
                             img_w, img_h = img.size
                             log.info("Rotated CCW 90° (DC=portrait, page=landscape)")
                         else:
-                            log.info("No rotation needed (DC=%s matches page=%s)",
+                            log.info("No rotation (DC=%s, page=%s)",
                                      'landscape' if dc_is_landscape else 'portrait',
                                      'landscape' if page_is_landscape else 'portrait')
 
-
-                        # ── Downscale to available area (LANCZOS) ──
-                        scale = min(avail_w / img_w, avail_h / img_h)
-                        new_w = int(img_w * scale)
-                        new_h = int(img_h * scale)
-                        img = img.resize((new_w, new_h), Image.LANCZOS)
-                        img_w, img_h = new_w, new_h
-                        log.info("Downscaled to %dx%d (avail=%dx%d, margins L%d R%d T%d B%d px)",
-                                 img_w, img_h, avail_w, avail_h, margin_l, margin_r, margin_t, margin_b)
-
                         # ── Send via StretchDIBits ──
+                        # dst size = avail_w × avail_h (full printable area minus margins)
+                        # src size = rendered image size
+                        # GDI stretches/shrinks to fill correctly for ANY DPI configuration.
                         import ctypes
 
                         # Convert RGB → BGR (Windows GDI 24-bit expects BGR)
@@ -785,8 +765,8 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         bmi.biBitCount      = 24
                         bmi.biCompression   = 0
                         bmi.biSizeImage     = stride * img_h
-                        bmi.biXPelsPerMeter = int(dpi_x / 0.0254)
-                        bmi.biYPelsPerMeter = int(dpi_y / 0.0254)
+                        bmi.biXPelsPerMeter = int(RENDER_DPI / 0.0254)
+                        bmi.biYPelsPerMeter = int(RENDER_DPI / 0.0254)
                         bmi.biClrUsed       = 0
                         bmi.biClrImportant  = 0
 
@@ -800,23 +780,21 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         ]
                         gdi32.StretchDIBits.restype = ctypes.c_int
 
-                        # Destination: offset by physical margin + user margin
-                        dst_x = margin_l
-                        dst_y = margin_t
-
                         hdc = dc.GetSafeHdc()
                         dc.StartPage()
                         result = gdi32.StretchDIBits(
                             hdc,
-                            dst_x, dst_y, img_w, img_h,  # destination (with margin offset)
-                            0, 0, img_w, img_h,           # source
+                            margin_l, margin_t, avail_w, avail_h,  # dst: fill available area
+                            0, 0, img_w, img_h,                     # src: full rendered image
                             pixel_data,
                             ctypes.byref(bmi),
                             0,          # DIB_RGB_COLORS
                             0x00CC0020, # SRCCOPY
                         )
                         dc.EndPage()
-                        log.info("StretchDIBits: result=%s (expected=%d lines)", result, img_h)
+                        log.info("StretchDIBits: %dx%d src → %dx%d dst, result=%s",
+                                 img_w, img_h, avail_w, avail_h, result)
+
 
 
                 dc.EndDoc()
