@@ -616,6 +616,175 @@ def _create_devmode_for_options(printer_name, options):
     return None, None
 
 
+def _print_pdf_windows(printer_name, pdf_path, options):
+    """
+    Print a PDF file directly via Windows GDI using PyMuPDF for rendering.
+    
+    This bypasses SumatraPDF entirely, giving us full control over the DevMode
+    (paper size, orientation) without any auto-rotation interference.
+    
+    Flow:
+      1. Build DevMode from options (paper ID, dimensions)
+      2. Open a printer DC with that DevMode using win32print + win32ui
+      3. Use PyMuPDF (fitz) to render each page at the printer's DPI
+      4. BitBlt the rendered bitmap onto the printer DC
+      5. Eject the page
+    """
+    try:
+        import fitz  # PyMuPDF
+        import win32print
+        import win32ui
+        import win32con
+        from PIL import Image
+        import io
+        import struct
+
+        devmode, paper_name = _create_devmode_for_options(printer_name, options)
+        log.info("GDI print: printer=%s paper=%s devmode=%s", printer_name, paper_name, devmode is not None)
+
+        # Open a printer DC with our exact DevMode.
+        # win32ui.CreateDC() wraps the Windows CreateDC() GDI call.
+        # "WINSPOOL" is the print driver type; device=printer_name; devmode from our options.
+        dc = win32ui.CreateDC()
+        dc.CreatePrinterDC(printer_name)
+        # Apply our DevMode if available (ResetDC rebuilds the DC with a new DevMode)
+        if devmode:
+            dc.ResetDC(devmode)
+
+        try:
+            # Get printer physical dimensions in pixels
+            pwidth_px  = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
+            pheight_px = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
+            dpi_x      = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+            dpi_y      = dc.GetDeviceCaps(win32con.LOGPIXELSY)
+            offset_x   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
+            offset_y   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
+
+            log.info("Printer DC: %dx%d px @ %d×%d dpi, offset=%d,%d",
+                     pwidth_px, pheight_px, dpi_x, dpi_y, offset_x, offset_y)
+
+            # Open PDF
+            doc = fitz.open(pdf_path)
+            copies = int(options.get('copies', 1)) if options else 1
+
+            doc_info = win32ui.DOCINFO()
+            doc_info['szDocName'] = 'PrintHub Job'
+
+            dc.StartDoc(doc_info)
+
+            for copy in range(copies):
+                for page_num in range(len(doc)):
+                    page = doc[page_num]
+                    
+                    # Render page at printer DPI — use the page's natural size
+                    # fitz matrix: 1 unit = 1 point (1/72 inch)
+                    # scale to printer DPI
+                    mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
+                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                    
+                    img_data = pix.tobytes("ppm")
+                    img = Image.open(io.BytesIO(img_data))
+                    img = img.convert("RGB")
+
+                    img_w, img_h = img.size
+                    log.info("Page %d: rendered %dx%d px for printer %dx%d px",
+                             page_num + 1, img_w, img_h, pwidth_px, pheight_px)
+
+                    # Scale image to fill the printable area if needed
+                    printable_w = pwidth_px - 2 * offset_x
+                    printable_h = pheight_px - 2 * offset_y
+                    if printable_w > 0 and printable_h > 0:
+                        scale = min(printable_w / img_w, printable_h / img_h)
+                        new_w = int(img_w * scale)
+                        new_h = int(img_h * scale)
+                        if scale != 1.0:
+                            img = img.resize((new_w, new_h), Image.LANCZOS)
+                            img_w, img_h = new_w, new_h
+
+                    # Convert PIL image to a Windows HBITMAP
+                    # Write BMP in memory for win32ui
+                    bmp_buf = io.BytesIO()
+                    img.save(bmp_buf, format="BMP")
+                    bmp_buf.seek(0)
+                    bmp_bytes = bmp_buf.read()
+
+                    # Create a memory DC and bitmap
+                    mem_dc = dc.CreateCompatibleDC()
+                    bmp = win32ui.CreateBitmap()
+                    bmp.CreateBitmapFromBmpData(bmp_bytes)
+                    old_bmp = mem_dc.SelectObject(bmp)
+
+                    dc.StartPage()
+                    # BitBlt: destination (x, y, w, h) from source (0, 0)
+                    dc.BitBlt((0, 0), (img_w, img_h), mem_dc, (0, 0), win32con.SRCCOPY)
+                    dc.EndPage()
+
+                    mem_dc.SelectObject(old_bmp)
+                    mem_dc.DeleteDC()
+                    bmp.DeleteObject()
+
+            dc.EndDoc()
+            total_pages = len(doc)
+            doc.close()
+            log.info("GDI print complete: %d page(s), %d copy(ies)", total_pages, copies)
+            return True, ""
+
+        finally:
+            dc.DeleteDC()
+
+    except ImportError as e:
+        log.warning("PyMuPDF not available, falling back to SumatraPDF: %s", e)
+        return _print_pdf_sumatra(printer_name, pdf_path, options)
+    except Exception as e:
+        log.error("GDI print failed: %s", e, exc_info=True)
+        log.info("Falling back to SumatraPDF...")
+        return _print_pdf_sumatra(printer_name, pdf_path, options)
+
+
+def _print_pdf_sumatra(printer_name, pdf_path, options):
+    """Fallback: print via SumatraPDF (used only if PyMuPDF is unavailable)."""
+    try:
+        sumatra_path = _get_sumatra_path()
+        if not sumatra_path:
+            import win32api
+            win32api.ShellExecute(0, "printto", pdf_path, f'"{printer_name}"', ".", 0)
+            return True, ""
+
+        devmode, paper_name = _create_devmode_for_options(printer_name, options)
+        if devmode:
+            import win32print
+            hprinter = win32print.OpenPrinter(printer_name,
+                {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
+            try:
+                pinfo = win32print.GetPrinter(hprinter, 2)
+                original_devmode = pinfo['pDevMode']
+                pinfo['pDevMode'] = devmode
+                win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                log.info("SumatraPDF fallback: printer default set to paper=%s", paper_name)
+                try:
+                    cmd = [sumatra_path, "-print-to", printer_name, "-silent", pdf_path]
+                    log.info("SumatraPDF cmd: %s", ' '.join(cmd))
+                    subprocess.run(cmd, check=True, timeout=60)
+                finally:
+                    import time as _time
+                    _time.sleep(2)
+                    pinfo['pDevMode'] = original_devmode
+                    win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                    log.info("SumatraPDF fallback: printer default restored.")
+            finally:
+                win32print.ClosePrinter(hprinter)
+        else:
+            cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
+            cmd += _build_sumatra_options(options, printer_name)
+            cmd.append(pdf_path)
+            log.info("SumatraPDF cmd (no DevMode): %s", ' '.join(cmd))
+            subprocess.run(cmd, check=True, timeout=60)
+        return True, ""
+    except Exception as e:
+        log.error("SumatraPDF fallback failed: %s", e, exc_info=True)
+        return False, str(e)
+
+
 def print_pdf(printer_name, pdf_base64, options=None):
     """Decodes a base64 PDF and prints it silently using OS handlers."""
     import base64
@@ -637,72 +806,7 @@ def print_pdf(printer_name, pdf_base64, options=None):
             f.write(pdf_bytes)
 
         if is_windows():
-            sumatra_path = _get_sumatra_path()
-            if sumatra_path:
-                try:
-                    # Build the DevMode with correct paper settings
-                    devmode, paper_name = _create_devmode_for_options(printer_name, options)
-                    
-                    if devmode:
-                        # Strategy: Temporarily set the printer default, then print
-                        log.info("Using DevMode override strategy for printer '%s' (paper=%s)", 
-                                 printer_name, paper_name)
-                        
-                        import win32print
-                        hprinter = win32print.OpenPrinter(printer_name, 
-                            {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
-                        try:
-                            # Save original
-                            pinfo = win32print.GetPrinter(hprinter, 2)
-                            original_devmode = pinfo['pDevMode']
-                            
-                            # Apply our DevMode as the printer default
-                            pinfo['pDevMode'] = devmode
-                            win32print.SetPrinter(hprinter, 2, pinfo, 0)
-                            log.info("Printer default temporarily changed to custom paper.")
-                            
-                            try:
-                                # SumatraPDF will now use the printer's default (which we just set)
-                                # Don't pass orientation/paper to SumatraPDF — DevMode handles it.
-                                # Only pass non-layout options like fit, copies, etc.
-                                cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
-                                sumatra_parts = []
-                                if options.get('fit_to_page'):
-                                    sumatra_parts.append('fit')
-                                if sumatra_parts:
-                                    cmd += ['-print-settings', ','.join(sumatra_parts)]
-                                cmd.append(temp_path)
-                                log.info("SumatraPDF cmd: %s", ' '.join(cmd))
-                                subprocess.run(cmd, check=True, timeout=60)
-                            finally:
-                                # Restore original printer settings
-                                import time as _time
-                                _time.sleep(2)  # Give spooler time to pick up the job
-                                pinfo['pDevMode'] = original_devmode
-                                win32print.SetPrinter(hprinter, 2, pinfo, 0)
-                                log.info("Printer default restored.")
-                        finally:
-                            win32print.ClosePrinter(hprinter)
-                    else:
-                        # No custom DevMode needed, just use SumatraPDF normally
-                        cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
-                        cmd += _build_sumatra_options(options, printer_name)
-                        cmd.append(temp_path)
-                        log.info("SumatraPDF cmd (no DevMode): %s", ' '.join(cmd))
-                        subprocess.run(cmd, check=True, timeout=60)
-                    
-                    success = True
-                except Exception as e:
-                    error_msg = str(e)
-                    log.error("SumatraPDF Print Error: %s", e, exc_info=True)
-            else:
-                import win32api
-                try:
-                    win32api.ShellExecute(0, "printto", temp_path, f'"{printer_name}"', ".", 0)
-                    success = True
-                except Exception as e:
-                    error_msg = str(e)
-                    log.error("Windows PDF Print Error: %s", e)
+            success, error_msg = _print_pdf_windows(printer_name, temp_path, options)
         else:
             try:
                 cmd = ['lp', '-d', printer_name]

@@ -32,6 +32,8 @@ def build():
         '--hidden-import=win32print',
         '--hidden-import=win32con',
         '--hidden-import=win32api',
+        '--hidden-import=win32ui',
+        '--hidden-import=fitz',
     ]
 
     # Data files to include inside the bundle (read-only templates/icons)
