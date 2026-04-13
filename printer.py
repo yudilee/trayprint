@@ -584,16 +584,23 @@ def _create_devmode_for_options(printer_name, options):
                 modified = True
             
             if modified:
-                # Validate the DevMode through DocumentProperties
-                # DM_IN_BUFFER: read from devmode input
-                # DM_OUT_BUFFER: write validated result to devmode output
-                result = win32print.DocumentProperties(
-                    0, hprinter, printer_name, devmode, devmode,
-                    win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER
-                )
-                log.info("DevMode validated (result=%s). Final: PaperSize=%s, W=%s, H=%s, Orient=%s",
-                         result, devmode.PaperSize, devmode.PaperWidth, 
-                         devmode.PaperLength, devmode.Orientation)
+                if paper_id:
+                    # When we have a paper ID from the driver's own DC_PAPERS list,
+                    # skip DocumentProperties validation — it reverts custom form IDs.
+                    # The ID is valid since the driver itself reported it.
+                    log.info("DevMode ready (skipping validation for known paper ID=%d '%s'). "
+                             "PaperSize=%s, W=%s, H=%s, Orient=%s",
+                             paper_id, paper_name, devmode.PaperSize, 
+                             devmode.PaperWidth, devmode.PaperLength, devmode.Orientation)
+                else:
+                    # For generic custom sizes, validate through DocumentProperties
+                    result = win32print.DocumentProperties(
+                        0, hprinter, printer_name, devmode, devmode,
+                        win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER
+                    )
+                    log.info("DevMode validated (result=%s). Final: PaperSize=%s, W=%s, H=%s, Orient=%s",
+                             result, devmode.PaperSize, devmode.PaperWidth, 
+                             devmode.PaperLength, devmode.Orientation)
                 return devmode, paper_name
         finally:
             win32print.ClosePrinter(hprinter)
