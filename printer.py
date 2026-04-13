@@ -145,7 +145,122 @@ def _build_lp_options(options):
     return args
 
 
-def _build_sumatra_options(options):
+def _find_windows_paper_name(printer_name, w_mm, h_mm):
+    """
+    Queries the Windows printer driver for all supported paper sizes
+    and returns the name of the one matching the given width/height.
+    """
+    if not is_windows() or not printer_name:
+        return None
+    try:
+        import win32print
+        import win32con
+        # DeviceCapabilities returns paper names and sizes
+        names = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERNAMES)
+        sizes = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERSIZE)
+        ids = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERS)
+        
+        # sizes are in 0.1mm units. 
+        # Example: 210mm = 2100 units
+        target_w = int(float(w_mm) * 10)
+        target_h = int(float(h_mm) * 10)
+        
+        for i, (w, h) in enumerate(sizes):
+            # Use a tolerance of 2 units (0.2mm)
+            if abs(w - target_w) <= 2 and abs(h - target_h) <= 2:
+                log.info("Matched Windows paper size by dimensions: %s (ID:%d) (%dx%d)", names[i], ids[i], w, h)
+                return names[i], ids[i]
+        
+        # Try swapped dimensions for orientation-agnostic drivers
+        for i, (w, h) in enumerate(sizes):
+            if abs(h - target_w) <= 2 and abs(w - target_h) <= 2:
+                log.info("Matched Windows paper size by swapped dimensions: %s (ID:%d) (%dx%d)", names[i], ids[i], w, h)
+                return names[i], ids[i]
+                
+    except Exception as e:
+        log.debug("Error finding Windows paper name: %s", e)
+    return None, None
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def windows_printer_override(printer_name, options):
+    """
+    Context manager that temporarily overrides the printer's DEFAULT DevMode 
+    at the OS level to force paper size, then restores it.
+    """
+    if not is_windows() or not printer_name or not options:
+        yield
+        return
+
+    try:
+        import win32print
+        import win32con
+        
+        # Open printer with administrative access to change settings
+        # Use PRINTER_ALL_ACCESS if possible, or fall back to PRINTER_ACCESS_ADMINISTER | PRINTER_ACCESS_USE
+        try:
+            hprinter = win32print.OpenPrinter(printer_name, {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
+        except:
+            hprinter = win32print.OpenPrinter(printer_name, {"DesiredAccess": win32con.PRINTER_ACCESS_ADMINISTER | win32con.PRINTER_ACCESS_USE})
+            
+        try:
+            # 1. Backup original settings
+            pinfo = win32print.GetPrinter(hprinter, 2)
+            original_devmode = pinfo['pDevMode']
+            
+            # 2. Find matching paper index/name
+            w_mm = options.get('paper_width_mm')
+            h_mm = options.get('paper_height_mm')
+            paper_name, paper_id = _find_windows_paper_name(printer_name, w_mm, h_mm)
+            
+            # 3. Create modified DevMode
+            # We must use DocumentProperties to correctly modify a DevMode object
+            new_devmode = win32print.DocumentProperties(0, hprinter, printer_name, original_devmode, original_devmode, 0)
+            
+            modified = False
+            if paper_id:
+                new_devmode.PaperSize = paper_id
+                new_devmode.Fields |= win32con.DM_PAPERSIZE
+                modified = True
+            
+            if w_mm and h_mm:
+                new_devmode.PaperWidth = int(float(w_mm) * 10)
+                new_devmode.PaperLength = int(float(h_mm) * 10)
+                new_devmode.Fields |= (win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
+                modified = True
+                
+            orientation = options.get('orientation')
+            if orientation == 'landscape':
+                new_devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                new_devmode.Fields |= win32con.DM_ORIENTATION
+                modified = True
+            elif orientation == 'portrait':
+                new_devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                new_devmode.Fields |= win32con.DM_ORIENTATION
+                modified = True
+
+            if modified:
+                log.info("Applying temporary Windows DevMode override: paper=%s, id=%s, orient=%s", paper_name, paper_id, orientation)
+                pinfo['pDevMode'] = new_devmode
+                win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                
+            yield # Run the SumatraPDF command now
+            
+        finally:
+            if modified:
+                log.info("Restoring original Windows printer settings.")
+                pinfo['pDevMode'] = original_devmode
+                win32print.SetPrinter(hprinter, 2, pinfo, 0)
+            win32print.ClosePrinter(hprinter)
+            
+    except Exception as e:
+        log.warning("Windows printer override failed: %s", e)
+        yield
+
+
+def _build_sumatra_options(options, printer_name=None):
     """Builds SumatraPDF -print-settings string."""
     parts = []
     if not options:
@@ -161,9 +276,26 @@ def _build_sumatra_options(options):
     else:
         parts.append('portrait')
 
-    # paper size (Sumatra only supports names, not mm dimensions via CLI)
+    # paper size
     paper = options.get('paper_size')
+    w_mm = options.get('paper_width_mm')
+    h_mm = options.get('paper_height_mm')
+
+    # Priority 1: Try to match exact dimensions to a Windows Paper Form (critical for Dot-Matrix)
+    if is_windows() and printer_name and w_mm and h_mm:
+        matched_name, matched_id = _find_windows_paper_name(printer_name, w_mm, h_mm)
+        if matched_name:
+            paper = matched_name
+
     if paper:
+        # Fallback mappings for common names that vary between Linux/Windows
+        # Example: Hub/Linux says "Half Letter", Windows driver says "Statement"
+        mappings = {
+            'Half Letter': 'Statement',
+            'halfletter': 'Statement',
+            'F4': 'Folio',
+        }
+        paper = mappings.get(paper, paper)
         parts.append(f'paper={paper}')
 
     duplex = options.get('duplex')
@@ -277,6 +409,89 @@ def print_raw(printer_name, data_str, options=None):
 #  PDF Printing
 # ─────────────────────────────────────────────
 
+def _create_devmode_for_options(printer_name, options):
+    """
+    Creates a DEVMODE structure with the correct paper size for win32print.
+    Returns (devmode, paper_name) or (None, None) on failure.
+    """
+    if not is_windows() or not options:
+        return None, None
+    
+    w_mm = options.get('paper_width_mm')
+    h_mm = options.get('paper_height_mm')
+    orientation = options.get('orientation')
+    
+    # Nothing to customize
+    if not w_mm and not h_mm and not orientation:
+        return None, None
+    
+    try:
+        import win32print
+        import win32con
+        import copy
+        
+        hprinter = win32print.OpenPrinter(printer_name)
+        try:
+            # Get the current default DevMode from the printer
+            pinfo = win32print.GetPrinter(hprinter, 2)
+            devmode = pinfo['pDevMode']
+            log.info("Got default DevMode: PaperSize=%s, W=%s, H=%s, Orient=%s, Fields=%s",
+                     devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength, 
+                     devmode.Orientation, devmode.Fields)
+            
+            paper_name = None
+            paper_id = None
+            
+            if w_mm and h_mm:
+                paper_name, paper_id = _find_windows_paper_name(printer_name, w_mm, h_mm)
+            
+            modified = False
+            
+            # Set paper size by ID if found (e.g., custom "kuitansi" form)
+            if paper_id:
+                devmode.PaperSize = paper_id
+                devmode.Fields |= win32con.DM_PAPERSIZE
+                modified = True
+                log.info("DevMode: Set PaperSize ID=%d (%s)", paper_id, paper_name)
+            
+            # Always set explicit dimensions for custom/dot-matrix
+            if w_mm and h_mm:
+                devmode.PaperWidth = int(float(w_mm) * 10)
+                devmode.PaperLength = int(float(h_mm) * 10)
+                devmode.Fields |= (win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
+                modified = True
+                log.info("DevMode: Set PaperWidth=%d, PaperLength=%d (0.1mm units)", 
+                         devmode.PaperWidth, devmode.PaperLength)
+            
+            # Orientation
+            if orientation == 'landscape':
+                devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                devmode.Fields |= win32con.DM_ORIENTATION
+                modified = True
+            elif orientation == 'portrait':
+                devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                devmode.Fields |= win32con.DM_ORIENTATION
+                modified = True
+            
+            if modified:
+                # Validate the DevMode through DocumentProperties
+                # DM_IN_BUFFER: read from devmode input
+                # DM_OUT_BUFFER: write validated result to devmode output
+                result = win32print.DocumentProperties(
+                    0, hprinter, printer_name, devmode, devmode,
+                    win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER
+                )
+                log.info("DevMode validated (result=%s). Final: PaperSize=%s, W=%s, H=%s, Orient=%s",
+                         result, devmode.PaperSize, devmode.PaperWidth, 
+                         devmode.PaperLength, devmode.Orientation)
+                return devmode, paper_name
+        finally:
+            win32print.ClosePrinter(hprinter)
+    except Exception as e:
+        log.warning("Failed to create DevMode: %s", e, exc_info=True)
+    return None, None
+
+
 def print_pdf(printer_name, pdf_base64, options=None):
     """Decodes a base64 PDF and prints it silently using OS handlers."""
     import base64
@@ -301,14 +516,55 @@ def print_pdf(printer_name, pdf_base64, options=None):
             sumatra_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SumatraPDF.exe")
             if os.path.exists(sumatra_path):
                 try:
-                    cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
-                    cmd += _build_sumatra_options(options)
-                    cmd.append(temp_path)
-                    subprocess.run(cmd, check=True)
+                    # Build the DevMode with correct paper settings
+                    devmode, paper_name = _create_devmode_for_options(printer_name, options)
+                    
+                    if devmode:
+                        # Strategy: Temporarily set the printer default, then print
+                        log.info("Using DevMode override strategy for printer '%s' (paper=%s)", 
+                                 printer_name, paper_name)
+                        
+                        import win32print
+                        hprinter = win32print.OpenPrinter(printer_name, 
+                            {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
+                        try:
+                            # Save original
+                            pinfo = win32print.GetPrinter(hprinter, 2)
+                            original_devmode = pinfo['pDevMode']
+                            
+                            # Apply our DevMode as the printer default
+                            pinfo['pDevMode'] = devmode
+                            win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                            log.info("Printer default temporarily changed to custom paper.")
+                            
+                            try:
+                                # SumatraPDF will now use the printer's default (which we just set)
+                                cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
+                                cmd += _build_sumatra_options(options, printer_name)
+                                cmd.append(temp_path)
+                                log.info("SumatraPDF cmd: %s", ' '.join(cmd))
+                                subprocess.run(cmd, check=True, timeout=60)
+                            finally:
+                                # Restore original printer settings
+                                import time as _time
+                                _time.sleep(2)  # Give spooler time to pick up the job
+                                pinfo['pDevMode'] = original_devmode
+                                win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                                log.info("Printer default restored.")
+                        finally:
+                            win32print.ClosePrinter(hprinter)
+                    else:
+                        # No custom DevMode needed, just use SumatraPDF normally
+                        cmd = [sumatra_path, "-print-to", printer_name, "-silent"]
+                        cmd += _build_sumatra_options(options, printer_name)
+                        cmd.append(temp_path)
+                        log.info("SumatraPDF cmd (no DevMode): %s", ' '.join(cmd))
+                        subprocess.run(cmd, check=True, timeout=60)
+                    
                     success = True
                 except Exception as e:
                     error_msg = str(e)
-                    log.error("SumatraPDF Print Error: %s", e)
+                    log.error("SumatraPDF Print Error: %s", e, exc_info=True)
             else:
                 import win32api
                 try:
@@ -331,10 +587,10 @@ def print_pdf(printer_name, pdf_base64, options=None):
         error_msg = str(e)
         log.error("PDF Parsing Error: %s", e)
 
-    # Cleanup temp file after 15s
+    # Cleanup temp file after 30s (longer wait for Windows spooler)
     if temp_path:
         def cleanup():
-            time.sleep(15)
+            time.sleep(30)
             try:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
