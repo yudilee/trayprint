@@ -602,8 +602,13 @@ function testConnection() {{
     def settings_save():
         data = request.get_json()
         try:
-            with open(config_path, 'r') as f:
-                cfg = json.load(f)
+            cfg = {}
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        cfg = json.load(f)
+                except Exception:
+                    pass
             cfg.update(data)
             with open(config_path, 'w') as f:
                 json.dump(cfg, f, indent=2)
