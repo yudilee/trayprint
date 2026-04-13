@@ -1,4 +1,5 @@
 import sys
+import os
 import subprocess
 from logger import get_logger
 
@@ -9,6 +10,28 @@ def is_windows():
 
 def is_macos():
     return sys.platform == 'darwin'
+
+
+def _get_sumatra_path():
+    """Find SumatraPDF.exe, handling PyInstaller --onefile bundles."""
+    candidates = []
+    
+    # 1. PyInstaller bundle extraction directory
+    if getattr(sys, 'frozen', False):
+        candidates.append(os.path.join(sys._MEIPASS, 'SumatraPDF.exe'))
+        # 2. Next to the exe itself (e.g., D:\trayprint\dist\SumatraPDF.exe)
+        candidates.append(os.path.join(os.path.dirname(sys.executable), 'SumatraPDF.exe'))
+    
+    # 3. Next to the source file (development mode)
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'SumatraPDF.exe'))
+    
+    for path in candidates:
+        if os.path.exists(path):
+            log.info("Found SumatraPDF at: %s", path)
+            return path
+    
+    log.warning("SumatraPDF.exe NOT FOUND in any of: %s", candidates)
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -513,8 +536,8 @@ def print_pdf(printer_name, pdf_base64, options=None):
             f.write(pdf_bytes)
 
         if is_windows():
-            sumatra_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SumatraPDF.exe")
-            if os.path.exists(sumatra_path):
+            sumatra_path = _get_sumatra_path()
+            if sumatra_path:
                 try:
                     # Build the DevMode with correct paper settings
                     devmode, paper_name = _create_devmode_for_options(printer_name, options)
