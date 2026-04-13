@@ -705,20 +705,29 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         log.info("Copy %d Page %d: rendered %dx%d @ %ddpi",
                                  copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x)
 
-                        # ── Orientation: rotate image if needed ──
-                        orientation = (options.get('orientation') or 'portrait').lower() if options else 'portrait'
+                        # ── Orientation: rotate page to match DC shape ──
+                        # Compare rendered PDF shape against the printer DC shape.
+                        # If they already match (both landscape or both portrait), do nothing.
+                        # Only rotate if they differ.
+                        # NOTE: Do NOT use the orientation option string here — for kuitansi,
+                        # the profile says 'portrait' but both PDF and DC are landscape-shaped.
+                        dc_is_landscape  = pwidth_px > pheight_px
                         page_is_landscape = img_w > img_h
-                        want_landscape = (orientation == 'landscape')
-                        if want_landscape and not page_is_landscape:
-                            # PDF page is portrait but we want landscape → rotate CW 90°
+                        if dc_is_landscape and not page_is_landscape:
+                            # DC is landscape but PDF page is portrait → rotate CW 90°
                             img = img.rotate(-90, expand=True)
                             img_w, img_h = img.size
-                            log.info("Rotated page CW 90° for landscape orientation")
-                        elif not want_landscape and page_is_landscape:
-                            # PDF page is landscape but we want portrait → rotate CCW 90°
+                            log.info("Rotated CW 90° (DC=landscape, page=portrait)")
+                        elif not dc_is_landscape and page_is_landscape:
+                            # DC is portrait but PDF page is landscape → rotate CCW 90°
                             img = img.rotate(90, expand=True)
                             img_w, img_h = img.size
-                            log.info("Rotated page CCW 90° for portrait orientation")
+                            log.info("Rotated CCW 90° (DC=portrait, page=landscape)")
+                        else:
+                            log.info("No rotation needed (DC=%s matches page=%s)",
+                                     'landscape' if dc_is_landscape else 'portrait',
+                                     'landscape' if page_is_landscape else 'portrait')
+
 
                         # ── Downscale to available area (LANCZOS) ──
                         scale = min(avail_w / img_w, avail_h / img_h)
