@@ -683,11 +683,10 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         avail_w = max((pwidth_px  - 2 * offset_x) - margin_l - margin_r, 1)
                         avail_h = max((pheight_px - 2 * offset_y) - margin_t - margin_b, 1)
 
-                        # ── Render at fixed 360dpi (square pixels, good quality) ──
-                        # Always render at 360dpi regardless of actual printer DPI.
-                        # StretchDIBits fills the exact DC area, handling any DPI config:
-                        # 180x180, 360x180, 360x360, 600dpi — all work without code changes.
-                        RENDER_DPI = 360
+                        # ── Render at 720dpi (2x oversampling for sharper text) ──
+                        # Higher render DPI = more pixels = finer text detail.
+                        # StretchDIBits with HALFTONE mode averages them smoothly.
+                        RENDER_DPI = 720
                         mat = fitz.Matrix(RENDER_DPI / 72.0, RENDER_DPI / 72.0)
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
@@ -781,6 +780,14 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         gdi32.StretchDIBits.restype = ctypes.c_int
 
                         hdc = dc.GetSafeHdc()
+
+                        # HALFTONE mode: Windows averages pixels when scaling
+                        # (default STRETCH_DELETESCANS discards rows — very poor for text)
+                        # SetBrushOrgEx is required after setting HALFTONE per Windows API.
+                        HALFTONE = 4
+                        gdi32.SetStretchBltMode(hdc, HALFTONE)
+                        gdi32.SetBrushOrgEx(hdc, 0, 0, None)
+
                         dc.StartPage()
                         result = gdi32.StretchDIBits(
                             hdc,
