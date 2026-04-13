@@ -707,7 +707,7 @@ def _print_pdf_windows(printer_name, pdf_path, options):
 
                         # 1. Convert RGB → BGR
                         r, g, b = img.split()
-                        img_bgr = img.__class__.merge('RGB', (b, g, r))
+                        img_bgr = Image.merge('RGB', (b, g, r))
 
                         # 2. Build padded pixel buffer (DWORD-aligned rows)
                         row_bytes  = img_w * 3
