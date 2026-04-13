@@ -688,19 +688,23 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         avail_w = max(avail_w, 1)
                         avail_h = max(avail_h, 1)
 
-                        # ── Render at printer's native DPI ──
-                        # When DC is 360dpi (forced via DevMode), render 1:1 for maximum sharpness.
-                        # No supersampling needed — we're already at the printer's best resolution.
-                        # If the driver reports only 180dpi despite our request, supersample 2x.
-                        render_dpi_x = dpi_x if dpi_x >= 300 else dpi_x * 2
-                        render_dpi_y = dpi_y if dpi_y >= 300 else dpi_y * 2
+                        # ── Render at printer's exact DPI per axis ──
+                        # The DC may have asymmetric DPI (e.g. 360x180 for LQ-2180).
+                        # Render using fitz.Matrix(dpi_x/72, dpi_y/72) so the rendered
+                        # image pixels map 1:1 to the printer DC with no aspect distortion.
+                        # If an axis is < 200dpi, supersample it 2x for better text quality.
+                        ss_x = 2 if dpi_x < 200 else 1
+                        ss_y = 2 if dpi_y < 200 else 1
+                        render_dpi_x = dpi_x * ss_x
+                        render_dpi_y = dpi_y * ss_y
                         mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
                         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                         img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi (DC=%dx%d)",
-                                 copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x, dpi_x, dpi_y)
+                        log.info("Copy %d Page %d: rendered %dx%d @ %dx%d dpi (DC=%dx%d, ss=%dx%d)",
+                                 copy_idx + 1, page_num + 1, img_w, img_h,
+                                 render_dpi_x, render_dpi_y, dpi_x, dpi_y, ss_x, ss_y)
 
                         # ── Orientation: rotate page to match DC shape ──
                         # Compare rendered PDF shape against the printer DC shape.
