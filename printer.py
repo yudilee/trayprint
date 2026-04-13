@@ -678,25 +678,35 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                     for page_num in range(total_pages):
                         page = doc[page_num]
 
-                        # Render at printer DPI (1 PDF point = 1/72 inch)
-                        mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
+                        # Supersample at 2× printer DPI for sharper text.
+                        # Rendering at 2x means 4× more pixels → higher quality antialiasing.
+                        # LANCZOS downscale to printer dimensions acts as a sharpening filter.
+                        supersample = 2
+                        render_dpi_x = dpi_x * supersample
+                        render_dpi_y = dpi_y * supersample
+                        mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
                         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
                         img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d → printer %dx%d px",
-                                 copy_idx + 1, page_num + 1, img_w, img_h, pwidth_px, pheight_px)
+                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi (2× supersample)",
+                                 copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x)
 
-                        # Scale to fill printable area (keep aspect ratio)
+                        # Downscale to fit printer's printable area (LANCZOS for sharpness)
                         printable_w = pwidth_px - 2 * offset_x
                         printable_h = pheight_px - 2 * offset_y
                         if printable_w > 0 and printable_h > 0:
-                            scale = min(printable_w / img_w, printable_h / img_h)
-                            if abs(scale - 1.0) > 0.01:
-                                img = img.resize((int(img_w * scale), int(img_h * scale)), Image.LANCZOS)
-                                img_w, img_h = img.size
-                                log.info("Scaled to %dx%d (scale=%.3f)", img_w, img_h, scale)
+                            target_w = printable_w
+                            target_h = printable_h
+                            # Preserve aspect ratio
+                            scale = min(target_w / img_w, target_h / img_h)
+                            new_w = int(img_w * scale)
+                            new_h = int(img_h * scale)
+                            img = img.resize((new_w, new_h), Image.LANCZOS)
+                            img_w, img_h = new_w, new_h
+                            log.info("Downscaled to %dx%d for printable area %dx%d",
+                                     img_w, img_h, printable_w, printable_h)
 
                         # Send image directly to printer HDC using StretchDIBits.
                         # Requirements for Windows GDI 24-bit DIB:
