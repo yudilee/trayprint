@@ -564,20 +564,6 @@ def _create_devmode_for_options(printer_name, options):
                 # CLEAR orientation flag — let the form shape control layout
                 devmode.Fields &= ~win32con.DM_ORIENTATION
 
-                # ── Force highest print resolution (360×360 dpi for LQ-2180) ──
-                # dmPrintQuality sets X-resolution; dmYResolution sets Y-resolution.
-                # DMRES_HIGH (-4) requests maximum quality but some drivers ignore it.
-                # Setting the explicit value (360) is more reliable.
-                DM_PRINTQUALITY = 0x0400
-                DM_YRESOLUTION  = 0x2000
-                try:
-                    devmode.PrintQuality = 360    # X-DPI
-                    devmode.YResolution  = 360    # Y-DPI
-                    devmode.Fields |= (DM_PRINTQUALITY | DM_YRESOLUTION)
-                    log.info("DevMode: requested 360x360 dpi")
-                except AttributeError:
-                    log.warning("DevMode: PrintQuality/YResolution not settable on this driver")
-
                 modified = True
                 log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d — orientation flag cleared",
                          paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
