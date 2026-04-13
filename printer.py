@@ -553,22 +553,31 @@ def _create_devmode_for_options(printer_name, options):
             
             # Set paper size by ID if found (e.g., custom "kuitansi" form)
             if paper_id:
-                # Set form ID + explicit dimensions matching the form.
-                # We MUST set W/H because the default DevMode has A4 values (2100x2970)
-                # and SumatraPDF uses those DC dimensions for auto-rotation decisions.
-                # By setting W=2413, H=1397 the DC is landscape-shaped (wider than tall)
-                # which matches the landscape PDF → SumatraPDF won't auto-rotate.
                 devmode.PaperSize = paper_id
                 devmode.Fields |= win32con.DM_PAPERSIZE
-                
+
                 if w_mm and h_mm:
-                    devmode.PaperWidth = int(float(w_mm) * 10)
+                    devmode.PaperWidth  = int(float(w_mm) * 10)
                     devmode.PaperLength = int(float(h_mm) * 10)
                     devmode.Fields |= (win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
-                
-                # CLEAR orientation flag — let the form shape control layout,  
-                # not an explicit portrait/landscape flag that SumatraPDF uses to decide rotation
+
+                # CLEAR orientation flag — let the form shape control layout
                 devmode.Fields &= ~win32con.DM_ORIENTATION
+
+                # ── Force highest print resolution (360×360 dpi for LQ-2180) ──
+                # dmPrintQuality sets X-resolution; dmYResolution sets Y-resolution.
+                # DMRES_HIGH (-4) requests maximum quality but some drivers ignore it.
+                # Setting the explicit value (360) is more reliable.
+                DM_PRINTQUALITY = 0x0400
+                DM_YRESOLUTION  = 0x2000
+                try:
+                    devmode.PrintQuality = 360    # X-DPI
+                    devmode.YResolution  = 360    # Y-DPI
+                    devmode.Fields |= (DM_PRINTQUALITY | DM_YRESOLUTION)
+                    log.info("DevMode: requested 360x360 dpi")
+                except AttributeError:
+                    log.warning("DevMode: PrintQuality/YResolution not settable on this driver")
+
                 modified = True
                 log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d — orientation flag cleared",
                          paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
@@ -693,17 +702,19 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         avail_w = max(avail_w, 1)
                         avail_h = max(avail_h, 1)
 
-                        # ── Render at 2× DPI for supersampling ──
-                        supersample = 2
-                        render_dpi_x = dpi_x * supersample
-                        render_dpi_y = dpi_y * supersample
+                        # ── Render at printer's native DPI ──
+                        # When DC is 360dpi (forced via DevMode), render 1:1 for maximum sharpness.
+                        # No supersampling needed — we're already at the printer's best resolution.
+                        # If the driver reports only 180dpi despite our request, supersample 2x.
+                        render_dpi_x = dpi_x if dpi_x >= 300 else dpi_x * 2
+                        render_dpi_y = dpi_y if dpi_y >= 300 else dpi_y * 2
                         mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
                         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                         img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi",
-                                 copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x)
+                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi (DC=%dx%d)",
+                                 copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x, dpi_x, dpi_y)
 
                         # ── Orientation: rotate page to match DC shape ──
                         # Compare rendered PDF shape against the printer DC shape.
