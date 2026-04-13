@@ -618,17 +618,14 @@ def _create_devmode_for_options(printer_name, options):
 
 def _print_pdf_windows(printer_name, pdf_path, options):
     """
-    Print a PDF file directly via Windows GDI using PyMuPDF for rendering.
-    
-    This bypasses SumatraPDF entirely, giving us full control over the DevMode
-    (paper size, orientation) without any auto-rotation interference.
-    
-    Flow:
-      1. Build DevMode from options (paper ID, dimensions)
-      2. Open a printer DC with that DevMode using win32print + win32ui
-      3. Use PyMuPDF (fitz) to render each page at the printer's DPI
-      4. BitBlt the rendered bitmap onto the printer DC
-      5. Eject the page
+    Print a PDF directly via Windows GDI + PyMuPDF — no SumatraPDF.
+
+    Strategy:
+      1. Build DevMode from options (paper ID=207, W/H dimensions)
+      2. Temporarily set printer default to our DevMode via SetPrinter
+      3. Create a printer DC (which inherits the default DevMode we just set)
+      4. PyMuPDF renders each page at printer DPI → BitBlt onto DC
+      5. Restore original printer default
     """
     try:
         import fitz  # PyMuPDF
@@ -637,103 +634,111 @@ def _print_pdf_windows(printer_name, pdf_path, options):
         import win32con
         from PIL import Image
         import io
-        import struct
 
         devmode, paper_name = _create_devmode_for_options(printer_name, options)
-        log.info("GDI print: printer=%s paper=%s devmode=%s", printer_name, paper_name, devmode is not None)
+        log.info("GDI print: printer=%s paper=%s", printer_name, paper_name)
 
-        # Open a printer DC with our exact DevMode.
-        # win32ui.CreateDC() wraps the Windows CreateDC() GDI call.
-        # "WINSPOOL" is the print driver type; device=printer_name; devmode from our options.
-        dc = win32ui.CreateDC()
-        dc.CreatePrinterDC(printer_name)
-        # Apply our DevMode if available (ResetDC rebuilds the DC with a new DevMode)
+        # ── Step 1: Temporarily set printer default to our DevMode ──
+        original_devmode = None
+        hprinter = None
         if devmode:
-            dc.ResetDC(devmode)
+            hprinter = win32print.OpenPrinter(printer_name,
+                {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
+            pinfo = win32print.GetPrinter(hprinter, 2)
+            original_devmode = pinfo['pDevMode']
+            pinfo['pDevMode'] = devmode
+            win32print.SetPrinter(hprinter, 2, pinfo, 0)
+            log.info("GDI: printer default set to paper=%s (ID=%s)", paper_name,
+                     devmode.PaperSize if devmode else None)
 
         try:
-            # Get printer physical dimensions in pixels
-            pwidth_px  = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
-            pheight_px = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
-            dpi_x      = dc.GetDeviceCaps(win32con.LOGPIXELSX)
-            dpi_y      = dc.GetDeviceCaps(win32con.LOGPIXELSY)
-            offset_x   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
-            offset_y   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
+            # ── Step 2: Create printer DC (uses our DevMode default) ──
+            dc = win32ui.CreateDC()
+            dc.CreatePrinterDC(printer_name)
 
-            log.info("Printer DC: %dx%d px @ %d×%d dpi, offset=%d,%d",
-                     pwidth_px, pheight_px, dpi_x, dpi_y, offset_x, offset_y)
+            try:
+                pwidth_px  = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
+                pheight_px = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
+                dpi_x      = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+                dpi_y      = dc.GetDeviceCaps(win32con.LOGPIXELSY)
+                offset_x   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
+                offset_y   = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
 
-            # Open PDF
-            doc = fitz.open(pdf_path)
-            copies = int(options.get('copies', 1)) if options else 1
+                log.info("Printer DC: %dx%d px @ %dx%d dpi, offset=%d,%d",
+                         pwidth_px, pheight_px, dpi_x, dpi_y, offset_x, offset_y)
 
-            doc_info = win32ui.DOCINFO()
-            doc_info['szDocName'] = 'PrintHub Job'
+                # ── Step 3: Render PDF with PyMuPDF ──
+                doc = fitz.open(pdf_path)
+                copies = max(1, int(options.get('copies', 1)) if options else 1)
 
-            dc.StartDoc(doc_info)
+                doc_info = win32ui.DOCINFO()
+                doc_info['szDocName'] = 'PrintHub Job'
+                dc.StartDoc(doc_info)
 
-            for copy in range(copies):
-                for page_num in range(len(doc)):
-                    page = doc[page_num]
-                    
-                    # Render page at printer DPI — use the page's natural size
-                    # fitz matrix: 1 unit = 1 point (1/72 inch)
-                    # scale to printer DPI
-                    mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
-                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-                    
-                    img_data = pix.tobytes("ppm")
-                    img = Image.open(io.BytesIO(img_data))
-                    img = img.convert("RGB")
+                total_pages = len(doc)
+                for copy_idx in range(copies):
+                    for page_num in range(total_pages):
+                        page = doc[page_num]
 
-                    img_w, img_h = img.size
-                    log.info("Page %d: rendered %dx%d px for printer %dx%d px",
-                             page_num + 1, img_w, img_h, pwidth_px, pheight_px)
+                        # Render at printer DPI (1 PDF point = 1/72 inch)
+                        mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
+                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
-                    # Scale image to fill the printable area if needed
-                    printable_w = pwidth_px - 2 * offset_x
-                    printable_h = pheight_px - 2 * offset_y
-                    if printable_w > 0 and printable_h > 0:
-                        scale = min(printable_w / img_w, printable_h / img_h)
-                        new_w = int(img_w * scale)
-                        new_h = int(img_h * scale)
-                        if scale != 1.0:
-                            img = img.resize((new_w, new_h), Image.LANCZOS)
-                            img_w, img_h = new_w, new_h
+                        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-                    # Convert PIL image to a Windows HBITMAP
-                    # Write BMP in memory for win32ui
-                    bmp_buf = io.BytesIO()
-                    img.save(bmp_buf, format="BMP")
-                    bmp_buf.seek(0)
-                    bmp_bytes = bmp_buf.read()
+                        img_w, img_h = img.size
+                        log.info("Copy %d Page %d: rendered %dx%d → printer %dx%d px",
+                                 copy_idx + 1, page_num + 1, img_w, img_h, pwidth_px, pheight_px)
 
-                    # Create a memory DC and bitmap
-                    mem_dc = dc.CreateCompatibleDC()
-                    bmp = win32ui.CreateBitmap()
-                    bmp.CreateBitmapFromBmpData(bmp_bytes)
-                    old_bmp = mem_dc.SelectObject(bmp)
+                        # Scale to fill printable area (keep aspect ratio)
+                        printable_w = pwidth_px - 2 * offset_x
+                        printable_h = pheight_px - 2 * offset_y
+                        if printable_w > 0 and printable_h > 0:
+                            scale = min(printable_w / img_w, printable_h / img_h)
+                            if abs(scale - 1.0) > 0.01:
+                                img = img.resize((int(img_w * scale), int(img_h * scale)), Image.LANCZOS)
+                                img_w, img_h = img.size
+                                log.info("Scaled to %dx%d (scale=%.3f)", img_w, img_h, scale)
 
-                    dc.StartPage()
-                    # BitBlt: destination (x, y, w, h) from source (0, 0)
-                    dc.BitBlt((0, 0), (img_w, img_h), mem_dc, (0, 0), win32con.SRCCOPY)
-                    dc.EndPage()
+                        # Convert to BMP bytes for win32ui bitmap
+                        bmp_buf = io.BytesIO()
+                        img.save(bmp_buf, format="BMP")
+                        bmp_bytes = bmp_buf.getvalue()
 
-                    mem_dc.SelectObject(old_bmp)
-                    mem_dc.DeleteDC()
-                    bmp.DeleteObject()
+                        # Create compatible memory DC + bitmap, BitBlt to printer
+                        mem_dc = dc.CreateCompatibleDC()
+                        bmp = win32ui.CreateBitmap()
+                        bmp.CreateBitmapFromBmpData(bmp_bytes)
+                        old_bmp = mem_dc.SelectObject(bmp)
 
-            dc.EndDoc()
-            total_pages = len(doc)
-            doc.close()
-            log.info("GDI print complete: %d page(s), %d copy(ies)", total_pages, copies)
-            return True, ""
+                        dc.StartPage()
+                        dc.BitBlt((0, 0), (img_w, img_h), mem_dc, (0, 0), win32con.SRCCOPY)
+                        dc.EndPage()
+
+                        mem_dc.SelectObject(old_bmp)
+                        mem_dc.DeleteDC()
+                        bmp.DeleteObject()
+
+                dc.EndDoc()
+                doc.close()
+                log.info("GDI print complete: %d page(s) x %d copy(ies)", total_pages, copies)
+                return True, ""
+
+            finally:
+                dc.DeleteDC()
 
         finally:
-            dc.DeleteDC()
+            # ── Step 4: Restore original printer default ──
+            if hprinter and original_devmode is not None:
+                import time as _t
+                _t.sleep(2)  # let spooler pick up the job first
+                pinfo['pDevMode'] = original_devmode
+                win32print.SetPrinter(hprinter, 2, pinfo, 0)
+                win32print.ClosePrinter(hprinter)
+                log.info("GDI: printer default restored.")
 
     except ImportError as e:
-        log.warning("PyMuPDF not available, falling back to SumatraPDF: %s", e)
+        log.warning("PyMuPDF not available, using SumatraPDF fallback: %s", e)
         return _print_pdf_sumatra(printer_name, pdf_path, options)
     except Exception as e:
         log.error("GDI print failed: %s", e, exc_info=True)
