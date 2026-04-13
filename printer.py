@@ -698,20 +698,39 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                                 img_w, img_h = img.size
                                 log.info("Scaled to %dx%d (scale=%.3f)", img_w, img_h, scale)
 
-                        # Send image to printer using StretchDIBits (no bitmap object needed)
-                        # StretchDIBits sends raw pixel bytes directly to the printer HDC.
+                        # Send image directly to printer HDC using StretchDIBits.
+                        # Requirements for Windows GDI 24-bit DIB:
+                        #   1. Pixel order: BGR (not RGB)
+                        #   2. Each scan row padded to DWORD (4-byte) boundary
+                        #   3. Pixel buffer must be a stable ctypes buffer (not bare bytes)
                         import ctypes
-                        import ctypes.wintypes
 
-                        # PIL raw bytes: RGB, 3 bytes per pixel, rows top-to-bottom
-                        raw_pixels = img.tobytes()  # RGB, top-down
+                        # 1. Convert RGB → BGR
+                        r, g, b = img.split()
+                        img_bgr = img.__class__.merge('RGB', (b, g, r))
 
-                        # Build BITMAPINFOHEADER
+                        # 2. Build padded pixel buffer (DWORD-aligned rows)
+                        row_bytes  = img_w * 3
+                        pad_bytes  = (4 - (row_bytes % 4)) % 4
+                        raw_rgb    = img_bgr.tobytes()  # flat, unpadded
+                        if pad_bytes:
+                            padded = bytearray()
+                            padding = b'\x00' * pad_bytes
+                            for row in range(img_h):
+                                padded += raw_rgb[row * row_bytes:(row + 1) * row_bytes]
+                                padded += padding
+                            pixel_data = ctypes.create_string_buffer(bytes(padded))
+                        else:
+                            pixel_data = ctypes.create_string_buffer(raw_rgb)
+
+                        stride = row_bytes + pad_bytes  # bytes per row (aligned)
+
+                        # 3. Build BITMAPINFOHEADER
                         class BITMAPINFOHEADER(ctypes.Structure):
                             _fields_ = [
                                 ('biSize',          ctypes.c_uint32),
                                 ('biWidth',         ctypes.c_int32),
-                                ('biHeight',        ctypes.c_int32),   # negative = top-down
+                                ('biHeight',        ctypes.c_int32),
                                 ('biPlanes',        ctypes.c_uint16),
                                 ('biBitCount',      ctypes.c_uint16),
                                 ('biCompression',   ctypes.c_uint32),
@@ -725,32 +744,43 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         bmi = BITMAPINFOHEADER()
                         bmi.biSize          = ctypes.sizeof(BITMAPINFOHEADER)
                         bmi.biWidth         = img_w
-                        bmi.biHeight        = -img_h   # negative = top-down (matches PIL order)
+                        bmi.biHeight        = -img_h   # negative = top-down
                         bmi.biPlanes        = 1
-                        bmi.biBitCount      = 24       # RGB
+                        bmi.biBitCount      = 24
                         bmi.biCompression   = 0        # BI_RGB
-                        bmi.biSizeImage     = 0
+                        bmi.biSizeImage     = stride * img_h
                         bmi.biXPelsPerMeter = int(dpi_x / 0.0254)
                         bmi.biYPelsPerMeter = int(dpi_y / 0.0254)
                         bmi.biClrUsed       = 0
                         bmi.biClrImportant  = 0
 
-                        hdc = dc.GetSafeHdc()
-                        SRCCOPY    = 0x00CC0020
-                        DIB_RGB_COLORS = 0
+                        # 4. Set explicit argtypes to avoid ctypes type-guessing on large buffers
+                        gdi32 = ctypes.windll.gdi32
+                        gdi32.StretchDIBits.argtypes = [
+                            ctypes.c_void_p,  # hdc
+                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # dst
+                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # src
+                            ctypes.c_void_p,  # lpBits
+                            ctypes.c_void_p,  # lpbmi
+                            ctypes.c_uint,    # iUsage
+                            ctypes.c_ulong,   # rop
+                        ]
+                        gdi32.StretchDIBits.restype = ctypes.c_int
 
+                        hdc = dc.GetSafeHdc()
                         dc.StartPage()
-                        result = ctypes.windll.gdi32.StretchDIBits(
+                        result = gdi32.StretchDIBits(
                             hdc,
-                            0, 0, img_w, img_h,      # destination rect
-                            0, 0, img_w, img_h,      # source rect
-                            raw_pixels,               # pixel data
-                            ctypes.byref(bmi),        # bitmap info
-                            DIB_RGB_COLORS,
-                            SRCCOPY,
+                            0, 0, img_w, img_h,          # destination
+                            0, 0, img_w, img_h,          # source
+                            pixel_data,                   # BGR pixel buffer
+                            ctypes.byref(bmi),            # bitmap info
+                            0,                            # DIB_RGB_COLORS
+                            0x00CC0020,                   # SRCCOPY
                         )
                         dc.EndPage()
-                        log.info("StretchDIBits result: %s (lines transferred)", result)
+                        log.info("StretchDIBits: result=%s (expected=%d lines)", result, img_h)
+
 
                 dc.EndDoc()
                 doc.close()
