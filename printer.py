@@ -678,9 +678,22 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                     for page_num in range(total_pages):
                         page = doc[page_num]
 
-                        # Supersample at 2× printer DPI for sharper text.
-                        # Rendering at 2x means 4× more pixels → higher quality antialiasing.
-                        # LANCZOS downscale to printer dimensions acts as a sharpening filter.
+                        # ── Margins: convert mm → pixels ──
+                        # options margins are in mm; convert to printer pixels
+                        mm_to_px_x = dpi_x / 25.4
+                        mm_to_px_y = dpi_y / 25.4
+                        margin_l = int((options.get('margin_left',   0) or 0) * mm_to_px_x) if options else 0
+                        margin_r = int((options.get('margin_right',  0) or 0) * mm_to_px_x) if options else 0
+                        margin_t = int((options.get('margin_top',    0) or 0) * mm_to_px_y) if options else 0
+                        margin_b = int((options.get('margin_bottom', 0) or 0) * mm_to_px_y) if options else 0
+
+                        # Printable area minus margins
+                        avail_w = (pwidth_px - 2 * offset_x) - margin_l - margin_r
+                        avail_h = (pheight_px - 2 * offset_y) - margin_t - margin_b
+                        avail_w = max(avail_w, 1)
+                        avail_h = max(avail_h, 1)
+
+                        # ── Render at 2× DPI for supersampling ──
                         supersample = 2
                         render_dpi_x = dpi_x * supersample
                         render_dpi_y = dpi_y * supersample
@@ -688,43 +701,47 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
 
                         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
                         img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi (2× supersample)",
+                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi",
                                  copy_idx + 1, page_num + 1, img_w, img_h, render_dpi_x)
 
-                        # Downscale to fit printer's printable area (LANCZOS for sharpness)
-                        printable_w = pwidth_px - 2 * offset_x
-                        printable_h = pheight_px - 2 * offset_y
-                        if printable_w > 0 and printable_h > 0:
-                            target_w = printable_w
-                            target_h = printable_h
-                            # Preserve aspect ratio
-                            scale = min(target_w / img_w, target_h / img_h)
-                            new_w = int(img_w * scale)
-                            new_h = int(img_h * scale)
-                            img = img.resize((new_w, new_h), Image.LANCZOS)
-                            img_w, img_h = new_w, new_h
-                            log.info("Downscaled to %dx%d for printable area %dx%d",
-                                     img_w, img_h, printable_w, printable_h)
+                        # ── Orientation: rotate image if needed ──
+                        orientation = (options.get('orientation') or 'portrait').lower() if options else 'portrait'
+                        page_is_landscape = img_w > img_h
+                        want_landscape = (orientation == 'landscape')
+                        if want_landscape and not page_is_landscape:
+                            # PDF page is portrait but we want landscape → rotate CW 90°
+                            img = img.rotate(-90, expand=True)
+                            img_w, img_h = img.size
+                            log.info("Rotated page CW 90° for landscape orientation")
+                        elif not want_landscape and page_is_landscape:
+                            # PDF page is landscape but we want portrait → rotate CCW 90°
+                            img = img.rotate(90, expand=True)
+                            img_w, img_h = img.size
+                            log.info("Rotated page CCW 90° for portrait orientation")
 
-                        # Send image directly to printer HDC using StretchDIBits.
-                        # Requirements for Windows GDI 24-bit DIB:
-                        #   1. Pixel order: BGR (not RGB)
-                        #   2. Each scan row padded to DWORD (4-byte) boundary
-                        #   3. Pixel buffer must be a stable ctypes buffer (not bare bytes)
+                        # ── Downscale to available area (LANCZOS) ──
+                        scale = min(avail_w / img_w, avail_h / img_h)
+                        new_w = int(img_w * scale)
+                        new_h = int(img_h * scale)
+                        img = img.resize((new_w, new_h), Image.LANCZOS)
+                        img_w, img_h = new_w, new_h
+                        log.info("Downscaled to %dx%d (avail=%dx%d, margins L%d R%d T%d B%d px)",
+                                 img_w, img_h, avail_w, avail_h, margin_l, margin_r, margin_t, margin_b)
+
+                        # ── Send via StretchDIBits ──
                         import ctypes
 
-                        # 1. Convert RGB → BGR
+                        # Convert RGB → BGR (Windows GDI 24-bit expects BGR)
                         r, g, b = img.split()
                         img_bgr = Image.merge('RGB', (b, g, r))
 
-                        # 2. Build padded pixel buffer (DWORD-aligned rows)
-                        row_bytes  = img_w * 3
-                        pad_bytes  = (4 - (row_bytes % 4)) % 4
-                        raw_rgb    = img_bgr.tobytes()  # flat, unpadded
+                        # Build DWORD-aligned pixel buffer
+                        row_bytes = img_w * 3
+                        pad_bytes = (4 - (row_bytes % 4)) % 4
+                        raw_rgb   = img_bgr.tobytes()
                         if pad_bytes:
-                            padded = bytearray()
+                            padded  = bytearray()
                             padding = b'\x00' * pad_bytes
                             for row in range(img_h):
                                 padded += raw_rgb[row * row_bytes:(row + 1) * row_bytes]
@@ -732,10 +749,9 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                             pixel_data = ctypes.create_string_buffer(bytes(padded))
                         else:
                             pixel_data = ctypes.create_string_buffer(raw_rgb)
+                        stride = row_bytes + pad_bytes
 
-                        stride = row_bytes + pad_bytes  # bytes per row (aligned)
-
-                        # 3. Build BITMAPINFOHEADER
+                        # BITMAPINFOHEADER
                         class BITMAPINFOHEADER(ctypes.Structure):
                             _fields_ = [
                                 ('biSize',          ctypes.c_uint32),
@@ -754,39 +770,40 @@ def _print_pdf_windows(printer_name, pdf_path, options):
                         bmi = BITMAPINFOHEADER()
                         bmi.biSize          = ctypes.sizeof(BITMAPINFOHEADER)
                         bmi.biWidth         = img_w
-                        bmi.biHeight        = -img_h   # negative = top-down
+                        bmi.biHeight        = -img_h
                         bmi.biPlanes        = 1
                         bmi.biBitCount      = 24
-                        bmi.biCompression   = 0        # BI_RGB
+                        bmi.biCompression   = 0
                         bmi.biSizeImage     = stride * img_h
                         bmi.biXPelsPerMeter = int(dpi_x / 0.0254)
                         bmi.biYPelsPerMeter = int(dpi_y / 0.0254)
                         bmi.biClrUsed       = 0
                         bmi.biClrImportant  = 0
 
-                        # 4. Set explicit argtypes to avoid ctypes type-guessing on large buffers
                         gdi32 = ctypes.windll.gdi32
                         gdi32.StretchDIBits.argtypes = [
-                            ctypes.c_void_p,  # hdc
-                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # dst
-                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # src
-                            ctypes.c_void_p,  # lpBits
-                            ctypes.c_void_p,  # lpbmi
-                            ctypes.c_uint,    # iUsage
-                            ctypes.c_ulong,   # rop
+                            ctypes.c_void_p,
+                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                            ctypes.c_void_p, ctypes.c_void_p,
+                            ctypes.c_uint, ctypes.c_ulong,
                         ]
                         gdi32.StretchDIBits.restype = ctypes.c_int
+
+                        # Destination: offset by physical margin + user margin
+                        dst_x = margin_l
+                        dst_y = margin_t
 
                         hdc = dc.GetSafeHdc()
                         dc.StartPage()
                         result = gdi32.StretchDIBits(
                             hdc,
-                            0, 0, img_w, img_h,          # destination
-                            0, 0, img_w, img_h,          # source
-                            pixel_data,                   # BGR pixel buffer
-                            ctypes.byref(bmi),            # bitmap info
-                            0,                            # DIB_RGB_COLORS
-                            0x00CC0020,                   # SRCCOPY
+                            dst_x, dst_y, img_w, img_h,  # destination (with margin offset)
+                            0, 0, img_w, img_h,           # source
+                            pixel_data,
+                            ctypes.byref(bmi),
+                            0,          # DIB_RGB_COLORS
+                            0x00CC0020, # SRCCOPY
                         )
                         dc.EndPage()
                         log.info("StretchDIBits: result=%s (expected=%d lines)", result, img_h)
