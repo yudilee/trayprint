@@ -171,69 +171,119 @@ def _build_lp_options(options):
 def _find_windows_paper_name(printer_name, w_mm, h_mm):
     """
     Queries the Windows printer driver for all supported paper sizes
-    and returns the name of the one matching the given width/height.
+    and returns (form_name, paper_id) matching the given width/height.
+    
+    Uses multiple strategies:
+    1. DeviceCapabilities DC_PAPERSIZE (works for most drivers)
+    2. EnumForms API (fallback for drivers like Epson LQ that return 0x0 sizes)
     """
     if not is_windows() or not printer_name:
         return None, None
     try:
         import win32print
         import win32con
-        # DeviceCapabilities returns paper names and sizes
+        
+        # Get paper names and IDs supported by this specific printer
         names = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERNAMES)
         sizes = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERSIZE)
         ids = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERS)
         
-        if not names or not sizes or not ids:
+        if not names or not ids:
             log.debug("DeviceCapabilities returned empty for %s", printer_name)
             return None, None
         
-        # Log all available paper sizes for debugging
+        # Build a name→ID lookup for this printer
+        printer_papers = {}
+        for i, name in enumerate(names):
+            if i < len(ids):
+                clean_name = name.strip() if isinstance(name, str) else str(name)
+                printer_papers[clean_name.lower()] = (clean_name, int(ids[i]))
+        
         log.info("Printer '%s' has %d paper sizes available", printer_name, len(names))
         for i, name in enumerate(names):
-            if i < len(sizes) and i < len(ids):
-                s = sizes[i]
-                # sizes can be tuples (w,h) or individual values - handle both
-                if isinstance(s, (list, tuple)):
-                    sw, sh = int(s[0]), int(s[1])
-                else:
-                    sw, sh = 0, 0
-                log.debug("  Paper[%d]: '%s' ID=%s size=%dx%d", i, name.strip() if isinstance(name, str) else name, ids[i], sw, sh)
+            if i < len(ids):
+                clean = name.strip() if isinstance(name, str) else str(name)
+                log.debug("  Paper[%d]: '%s' ID=%s", i, clean, ids[i])
         
-        # sizes are in 0.1mm units. 
-        # Example: 210mm = 2100 units
-        target_w = int(float(w_mm) * 10)
+        target_w = int(float(w_mm) * 10)  # 0.1mm units
         target_h = int(float(h_mm) * 10)
         
-        for i, s in enumerate(sizes):
-            if i >= len(names) or i >= len(ids):
-                break
-            # Handle both tuple and other formats
-            if isinstance(s, (list, tuple)):
-                w, h = int(s[0]), int(s[1])
+        # ── Strategy 1: Match via DC_PAPERSIZE dimensions ──
+        if sizes:
+            has_real_sizes = False
+            for s in sizes:
+                if isinstance(s, (list, tuple)) and (int(s[0]) > 0 or int(s[1]) > 0):
+                    has_real_sizes = True
+                    break
+            
+            if has_real_sizes:
+                for i, s in enumerate(sizes):
+                    if i >= len(names) or i >= len(ids):
+                        break
+                    if isinstance(s, (list, tuple)):
+                        w, h = int(s[0]), int(s[1])
+                    else:
+                        continue
+                    if abs(w - target_w) <= 5 and abs(h - target_h) <= 5:
+                        name = names[i].strip() if isinstance(names[i], str) else str(names[i])
+                        log.info("Matched via DC_PAPERSIZE: '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
+                        return name, int(ids[i])
+                    # Try swapped
+                    if abs(h - target_w) <= 5 and abs(w - target_h) <= 5:
+                        name = names[i].strip() if isinstance(names[i], str) else str(names[i])
+                        log.info("Matched via DC_PAPERSIZE (swapped): '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
+                        return name, int(ids[i])
+                log.debug("DC_PAPERSIZE: no dimension match found")
             else:
-                continue
-            # Use a tolerance of 5 units (0.5mm)
-            if abs(w - target_w) <= 5 and abs(h - target_h) <= 5:
-                name = names[i].strip() if isinstance(names[i], str) else str(names[i])
-                log.info("Matched Windows paper size by dimensions: '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
-                return name, int(ids[i])
+                log.info("DC_PAPERSIZE returned all zeros — using EnumForms fallback")
         
-        # Try swapped dimensions for orientation-agnostic drivers
-        for i, s in enumerate(sizes):
-            if i >= len(names) or i >= len(ids):
-                break
-            if isinstance(s, (list, tuple)):
-                w, h = int(s[0]), int(s[1])
-            else:
-                continue
-            if abs(h - target_w) <= 5 and abs(w - target_h) <= 5:
-                name = names[i].strip() if isinstance(names[i], str) else str(names[i])
-                log.info("Matched Windows paper size by swapped dimensions: '%s' (ID:%d) (%dx%d)", name, int(ids[i]), w, h)
-                return name, int(ids[i])
+        # ── Strategy 2: Match via EnumForms API ──
+        # EnumForms returns ALL Windows forms with actual dimensions
+        # Then we cross-reference with the printer's supported papers
+        try:
+            hprinter = win32print.OpenPrinter(printer_name)
+            try:
+                forms = win32print.EnumForms(hprinter)
+                log.debug("EnumForms returned %d forms", len(forms))
+                
+                for form in forms:
+                    # form is a dict with keys: Name, Flags, Size, ImageableArea
+                    form_name = form.get('Name', '')
+                    form_size = form.get('Size', {})
+                    # Size is in 0.001mm (thousandths of mm)
+                    fw = form_size.get('cx', 0) // 100  # convert to 0.1mm
+                    fh = form_size.get('cy', 0) // 100
+                    
+                    if abs(fw - target_w) <= 5 and abs(fh - target_h) <= 5:
+                        # Found a matching form! Now find it in the printer's paper list
+                        key = form_name.strip().lower()
+                        if key in printer_papers:
+                            matched_name, matched_id = printer_papers[key]
+                            log.info("Matched via EnumForms: '%s' (ID:%d) form_size=%dx%d (0.1mm)",
+                                     matched_name, matched_id, fw, fh)
+                            return matched_name, matched_id
+                        else:
+                            log.debug("Form '%s' matches dimensions but not in printer's paper list", form_name)
+                    
+                    # Try swapped
+                    if abs(fh - target_w) <= 5 and abs(fw - target_h) <= 5:
+                        key = form_name.strip().lower()
+                        if key in printer_papers:
+                            matched_name, matched_id = printer_papers[key]
+                            log.info("Matched via EnumForms (swapped): '%s' (ID:%d) form_size=%dx%d (0.1mm)",
+                                     matched_name, matched_id, fw, fh)
+                            return matched_name, matched_id
+            finally:
+                win32print.ClosePrinter(hprinter)
+        except Exception as ef:
+            log.warning("EnumForms fallback failed: %s", ef)
+        
+        log.info("No paper form matched dimensions %.1f x %.1f mm", w_mm, h_mm)
                 
     except Exception as e:
         log.warning("Error finding Windows paper name: %s", e, exc_info=True)
     return None, None
+
 
 
 from contextlib import contextmanager
