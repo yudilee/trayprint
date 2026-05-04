@@ -9,11 +9,13 @@ try:
     import win32con
     import win32api
     import win32ui
-except ImportError:
+    _win32_import_error = None
+except Exception as e:
     win32print = None
     win32con = None
     win32api = None
     win32ui = None
+    _win32_import_error = str(e)
 
 log = get_logger()
 
@@ -57,7 +59,7 @@ def get_printers():
 
     if is_windows():
         if not win32print:
-            log.error("Windows printer support missing (win32print not imported)")
+            log.error("Windows printer support missing: %s", _win32_import_error or "win32print not found")
             return []
             
         try:
@@ -142,6 +144,7 @@ def get_default_printer():
     """Returns the name of the OS default printer."""
     if is_windows():
         if not win32print:
+            log.error("Cannot get default printer: win32print import error: %s", _win32_import_error)
             return ''
         try:
             return win32print.GetDefaultPrinter()
@@ -564,7 +567,7 @@ def print_raw(printer_name, data_str, options=None):
 
     if is_windows():
         if not win32print:
-            return False, "Windows printer support missing"
+            return False, f"Windows printer support missing: { _win32_import_error }"
         try:
             
             # Open printer with write access

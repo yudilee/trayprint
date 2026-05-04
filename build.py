@@ -17,6 +17,17 @@ def build():
         print("✗ PyInstaller not found. Installing...")
         subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
 
+    # Check pywin32 (critical for Windows)
+    if sys.platform == 'win32':
+        try:
+            import win32print
+            print("✓ pywin32 (win32print) found")
+        except ImportError:
+            print("✗ pywin32 not found. Installing...")
+            subprocess.run([sys.executable, '-m', 'pip', 'install', 'pywin32'], check=True)
+            print("! NOTE: If build still fails with 'win32print not found', run this manually on Windows:")
+            print("  python Scripts/pywin32_postinstall.py -install")
+
     app_dir = os.path.dirname(os.path.abspath(__file__))
     dist_dir = os.path.join(app_dir, 'dist')
 
@@ -36,6 +47,11 @@ def build():
         '--hidden-import=printer',
         '--hidden-import=path_utils',
         '--hidden-import=logger',
+        '--hidden-import=difflib',
+        '--hidden-import=html',
+        '--hidden-import=http',
+        '--hidden-import=email',
+        '--hidden-import=encodings',
     ]
     
     if sys.platform == 'win32':
@@ -44,6 +60,9 @@ def build():
             '--hidden-import=win32con',
             '--hidden-import=win32api',
             '--hidden-import=win32ui',
+            '--hidden-import=win32timezone',
+            '--hidden-import=pywintypes',
+            '--hidden-import=pythoncom',
         ]
 
     # Data files to include inside the bundle (read-only templates/icons)
