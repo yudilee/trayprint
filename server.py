@@ -1,34 +1,109 @@
 import json
 import os
 import uuid
-import threading
+import time
 from datetime import datetime
 from collections import OrderedDict
+import threading
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+START_TIME = time.time()
+
+from flask import Flask, request, jsonify, render_template
 import printer
 from path_utils import get_root_dir
 from logger import get_logger
 
 log = get_logger()
 
+# ─────────────────────────────────────────────
+#  Printer Config Merge Support
+# ─────────────────────────────────────────────
+
+def load_printer_configs():
+    """Load per-printer saved configs from config.json."""
+    config_path = os.path.join(get_root_dir(), 'config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+                return data.get('printer_configs', {})
+    except Exception as e:
+        log.error("Error loading printer configs: %s", e)
+    return {}
+
+def merge_printer_config(printer_name, options):
+    """
+    Merge saved per-printer control fields into the given options dict.
+    
+    Strategy:
+      1. Look up printer_name in saved printer_configs from config.json
+      2. If found, use those values as base defaults
+      3. Override with any profile / request-level options
+      4. Profile / request options take precedence
+    """
+    if not printer_name:
+        return options
+
+    printer_configs = load_printer_configs()
+    saved = printer_configs.get(printer_name)
+    if not saved:
+        return options  # No saved config for this printer
+
+    # Saved config keys that map to printer control fields
+    control_keys = {'tray_source', 'color_mode', 'print_quality',
+                    'scaling_percentage', 'media_type', 'collate', 'reverse_order'}
+
+    # Start with saved config as base (only control fields)
+    base = {k: v for k, v in saved.items() if k in control_keys}
+
+    # Override with incoming options (profile / request values take precedence)
+    merged = {**base, **options}
+    log.info("Merged printer config for '%s': base=%s, override=%s → merged=%s",
+             printer_name, base, options, merged)
+    return merged
+
+APP_VERSION = "3.0.0"
+
 
 # ─────────────────────────────────────────────
 #  Job Queue (in-memory, thread-safe)
 # ─────────────────────────────────────────────
 
-class JobQueue:
-    """Thread-safe in-memory print job tracker."""
+import sqlite3
 
-    def __init__(self, max_history=50):
+class JobQueue:
+    """Thread-safe persistent print job tracker."""
+
+    def __init__(self, db_name='jobs.db', max_history=50):
         self._lock = threading.Lock()
-        self._jobs = OrderedDict()
+        self.db_path = os.path.join(get_root_dir(), db_name)
         self._max = max_history
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        id TEXT PRIMARY KEY,
+                        printer TEXT,
+                        type TEXT,
+                        options TEXT,
+                        status TEXT,
+                        error TEXT,
+                        created_at TEXT,
+                        completed_at TEXT,
+                        data_preview TEXT,
+                        _raw_data TEXT
+                    )
+                ''')
+                conn.commit()
 
     def create(self, printer_name, job_type, options=None, data_preview='', job_id=None):
         if not job_id:
             job_id = str(uuid.uuid4())[:8]
+        
+        now = datetime.now().isoformat()
         job = {
             'id': job_id,
             'printer': printer_name,
@@ -36,48 +111,145 @@ class JobQueue:
             'options': options or {},
             'status': 'pending',
             'error': None,
-            'created_at': datetime.now().isoformat(),
+            'created_at': now,
             'completed_at': None,
             'data_preview': data_preview[:80] if data_preview else '',
         }
+        
         with self._lock:
-            self._jobs[job_id] = job
-            # Trim old jobs
-            while len(self._jobs) > self._max:
-                self._jobs.popitem(last=False)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    INSERT INTO jobs (id, printer, type, options, status, error, created_at, completed_at, data_preview)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (job_id, printer_name, job_type, json.dumps(options or {}), 'pending', None, now, None, job['data_preview']))
+                
+                conn.execute('''
+                    DELETE FROM jobs WHERE id NOT IN (
+                        SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?
+                    )
+                ''', (self._max,))
+                conn.commit()
         return job
 
     def complete(self, job_id, success, error_msg=''):
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job:
-                job['status'] = 'success' if success else 'failed'
-                job['error'] = error_msg if not success else None
-                job['completed_at'] = datetime.now().isoformat()
+            with sqlite3.connect(self.db_path) as conn:
+                status = 'success' if success else 'failed'
+                error = error_msg if not success else None
+                now = datetime.now().isoformat()
+                conn.execute('''
+                    UPDATE jobs SET status = ?, error = ?, completed_at = ? WHERE id = ?
+                ''', (status, error, now, job_id))
+                conn.commit()
+
+    def _row_to_dict(self, row):
+        if not row: return None
+        return {
+            'id': row[0],
+            'printer': row[1],
+            'type': row[2],
+            'options': json.loads(row[3]) if row[3] else {},
+            'status': row[4],
+            'error': row[5],
+            'created_at': row[6],
+            'completed_at': row[7],
+            'data_preview': row[8]
+        }
 
     def get(self, job_id):
         with self._lock:
-            return self._jobs.get(job_id)
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute('SELECT * FROM jobs WHERE id = ?', (job_id,))
+                return self._row_to_dict(cur.fetchone())
 
     def list_recent(self, limit=50):
         with self._lock:
-            items = list(self._jobs.values())
-        return items[-limit:]
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute('SELECT * FROM jobs ORDER BY created_at ASC LIMIT ?', (limit,))
+                return [self._row_to_dict(row) for row in cur.fetchall()]
 
     def get_job_data(self, job_id):
-        """Returns the raw data for retry. We store it transiently."""
         with self._lock:
-            return self._jobs.get(job_id, {}).get('_raw_data')
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute('SELECT _raw_data FROM jobs WHERE id = ?', (job_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
 
     def store_job_data(self, job_id, data):
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job:
-                job['_raw_data'] = data
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('UPDATE jobs SET _raw_data = ? WHERE id = ?', (data, job_id))
+                conn.commit()
 
 
 # Global job queue
 _job_queue = JobQueue()
+_notification_callback = None
+
+# ── Printing state (for tray indicator) ──
+_is_printing = False
+_printing_lock = threading.Lock()
+
+# ── Cancel flags: job_id → threading.Event ──
+_cancel_flags = {}       # type: dict[str, threading.Event]
+_cancel_flags_lock = threading.Lock()
+
+def is_printing():
+    """Returns True if a job is currently being processed/printed."""
+    with _printing_lock:
+        return _is_printing
+
+def _set_printing(state: bool):
+    """Set the printing flag (thread-safe)."""
+    with _printing_lock:
+        global _is_printing
+        _is_printing = state
+
+def get_queue_status():
+    """
+    Returns a list of active/pending/recent jobs suitable for the queue dialog.
+    Each entry: {job_id, document_name, status, printer, created_at, type, error}
+    """
+    jobs = _job_queue.list_recent(50)
+    pending = [j for j in jobs if j['status'] == 'pending']
+    completed = [j for j in jobs if j['status'] != 'pending']
+    result = list(reversed(pending)) + list(reversed(completed))
+    return result
+
+def cancel_job(job_id):
+    """
+    Cancel a print job.
+    - Pending: remove from queue via a cancel flag
+    - Printing: signal the running thread to abort
+    Returns True if cancel was initiated, False if job not found.
+    """
+    job = _job_queue.get(job_id)
+    if not job:
+        return False
+
+    with _cancel_flags_lock:
+        if job_id not in _cancel_flags:
+            _cancel_flags[job_id] = threading.Event()
+        _cancel_flags[job_id].set()
+
+    log.info("Cancel flag set for job %s (status=%s)", job_id, job['status'])
+    return True
+
+def _check_cancelled(job_id):
+    """Check if a job has been cancelled. Returns True if cancelled."""
+    with _cancel_flags_lock:
+        flag = _cancel_flags.get(job_id)
+        if flag and flag.is_set():
+            return True
+    return False
+
+def _cleanup_cancel_flag(job_id):
+    """Remove cancel flag after job completes."""
+    with _cancel_flags_lock:
+        _cancel_flags.pop(job_id, None)
+
+
+_allowed_origins = ["http://127.0.0.1:*", "http://localhost:*"]
 
 
 # ─────────────────────────────────────────────
@@ -95,7 +267,7 @@ def load_profiles_from_config():
             with open(config_path, 'r') as f:
                 data = json.load(f)
                 _profiles = data.get('profiles', {})
-                log.info("Loaded %d profile(s) from config", len(_profiles))
+                log.info("Loaded %d queue(s) from config", len(_profiles))
     except Exception as e:
         log.error("Error loading profiles: %s", e)
 
@@ -110,7 +282,7 @@ def save_profiles_to_config(profiles):
         data['profiles'] = profiles
         with open(config_path, 'w') as f:
             json.dump(data, f, indent=2)
-        log.info("Saved %d profile(s) to config", len(profiles))
+        log.info("Saved %d queue(s) to config", len(profiles))
     except Exception as e:
         log.error("Error saving profiles: %s", e)
 
@@ -119,10 +291,26 @@ def get_profiles():
 
 
 # ─────────────────────────────────────────────
+#  Hub Response Validation
+# ─────────────────────────────────────────────
+
+def _check_hub_response(json_data, context=""):
+    """Validate Hub API response. Returns parsed data dict or None on failure."""
+    if not isinstance(json_data, dict):
+        log.error("Hub %s: invalid response type: %s", context, type(json_data).__name__)
+        return None
+    if not json_data.get('success', False):
+        error_msg = json_data.get('error', {}).get('message', json_data.get('error', 'Unknown error'))
+        log.error("Hub %s: API error — %s", context, error_msg)
+        return None
+    return json_data.get('data', {})
+
+
+# ─────────────────────────────────────────────
 #  Hub Sync & Spooler (background threads)
 # ─────────────────────────────────────────────
-import queue
-_internal_print_queue = queue.Queue()
+import queue as _queue
+_internal_print_queue = _queue.Queue()
 _hub_last_status = "Disconnected"
 _cached_printer_count = 0
 
@@ -134,97 +322,225 @@ def get_cached_printer_count():
 
 def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
     """Periodically pull profiles and print queue from the central hub."""
-    import time
     import requests
     import base64
 
     def sync_loop():
-        profile_counter = interval # Trigger immediately
-        status_counter = interval # Trigger immediately
+        profile_counter = interval  # Trigger immediately
+        status_counter = interval   # Trigger immediately
+        backoff = 1
+        max_backoff = 60
+
         while True:
             try:
                 headers = {'Authorization': f'Bearer {agent_key}'}
-                
+
                 # Report status (printers) every sync interval
                 if status_counter >= interval:
                     report_status_to_hub(hub_url, agent_key)
                     status_counter = 0
 
+                # Heartbeat — lightweight keepalive
+                try:
+                    resp = requests.post(f'{hub_url}/api/print-hub/heartbeat', headers=headers, timeout=5)
+                    if resp and resp.status_code == 200:
+                        log.debug("Heartbeat sent")
+                except Exception:
+                    pass  # heartbeat failures are non-critical
+
                 # Fast polling for queue
                 resp_queue = requests.get(f'{hub_url}/api/print-hub/queue', headers=headers, timeout=5)
+                jobs_found = False
                 if resp_queue.status_code == 200:
-                    global _hub_last_status
-                    _hub_last_status = "Connected"
-                    jobs = resp_queue.json().get('jobs', [])
-                    for j in jobs:
-                        log.info("Pulled job %s from hub.", j['job_id'])
-                        _internal_print_queue.put(j)
-                
-                # Slower polling for profiles
+                    json_data = resp_queue.json()
+                    data = _check_hub_response(json_data, "queue")
+                    if data is not None:
+                        global _hub_last_status
+                        _hub_last_status = "Connected"
+                        jobs = data.get('jobs', [])
+                        for j in jobs:
+                            log.info("Pulled job %s from hub.", j['job_id'])
+                            _internal_print_queue.put(j)
+                        jobs_found = len(jobs) > 0
+
+                # Slower polling for profiles and CORS
                 if profile_counter >= interval:
                     resp_prof = requests.get(f'{hub_url}/api/print-hub/profiles', headers=headers, timeout=10)
                     if resp_prof.status_code == 200:
-                        _hub_last_status = "Connected"
-                        new_profiles = resp_prof.json().get('profiles', {})
-                        save_profiles_to_config(new_profiles)
+                        json_data = resp_prof.json()
+                        data = _check_hub_response(json_data, "getProfiles")
+                        if data is not None:
+                            _hub_last_status = "Connected"
+                            # Hub returns profiles array → convert to dict keyed by name
+                            new_profiles_list = data.get('profiles', [])
+                            new_profiles = {}
+                            for p in new_profiles_list:
+                                name = p.get('name', '')
+                                if name:
+                                    new_profiles[name] = p
+                            log.info("Synced %d profile(s) from hub", len(new_profiles))
+                            save_profiles_to_config(new_profiles)
+
+                    try:
+                        resp_cors = requests.get(f'{hub_url}/api/print-hub/cors-origins', headers=headers, timeout=10)
+                        if resp_cors.status_code == 200:
+                            json_data = resp_cors.json()
+                            data = _check_hub_response(json_data, "cors-origins")
+                            if data is not None:
+                                origins = data.get('allowed_origins')
+                                if origins is not None:
+                                    global _allowed_origins
+                                    _allowed_origins = origins
+                    except Exception as ce:
+                        log.debug("Hub CORS sync failed: %s", ce)
+
                     profile_counter = 0
 
             except Exception as e:
                 log.debug("Hub sync failed (hub may be offline): %s", e)
                 _hub_last_status = "Offline"
-            
-            # Fast polling for queue every 5s
-            time.sleep(5)
-            profile_counter += 5
-            status_counter += 5
+
+            # Exponential backoff
+            if jobs_found:
+                backoff = 1
+            else:
+                backoff = min(backoff * 2, max_backoff)
+
+            time.sleep(backoff)
+            profile_counter += backoff
+            status_counter += backoff
 
     def spooler_loop():
-        while True:
-            hub_job = _internal_print_queue.get()
+        retry_queue = _queue.Queue()
+
+        def _process_job(job_data):
+            """Process a single print job with retries. Returns True on success."""
+            hub_job = job_data
             job_id = hub_job['job_id']
             printer_name = hub_job['printer']
             job_type = hub_job['type']
             options = hub_job['options'] or {}
             b64_data = hub_job.get('document_base64')
 
+            # Resolve profile from job options if available
+            profile_name = options.get('profile') or options.get('queue')
+            if profile_name and profile_name in _profiles:
+                profile = _profiles[profile_name]
+                # Profile printer takes precedence if no explicit printer was set
+                if not printer_name or printer_name == 'default':
+                    printer_name = profile.get('printer', printer_name)
+                # Merge profile fields as base (metadata keys excluded), request options override
+                meta_keys = {'id', 'name', 'printer', 'description', 'print_agent_id'}
+                profile_opts = {k: v for k, v in profile.items() if k not in meta_keys and v is not None}
+                merged = {**profile_opts, **options}
+                options = merged
+                log.info("Hub job %s: resolved profile '%s' → printer=%s, %d option(s)",
+                         job_id, profile_name, printer_name, len(options))
+
+            # Merge per-printer saved config (local defaults) — profile/request values override
+            if printer_name:
+                options = merge_printer_config(printer_name, options)
+
             if not b64_data:
-                _internal_print_queue.task_done()
-                continue
-                
+                return False
+
             raw_data = base64.b64decode(b64_data)
-            
-            # Create local job record
-            if job_id in _job_queue._jobs:
-                _internal_print_queue.task_done()
-                continue
+
+            # Skip if already processed (non-pending)
+            existing = _job_queue.get(job_id)
+            if existing and existing['status'] != 'pending':
+                return True  # already handled
+
+            # Check if cancelled before we even start
+            if _check_cancelled(job_id):
+                log.info("Job %s cancelled before starting", job_id)
+                _job_queue.complete(job_id, False, 'Cancelled')
+                _cleanup_cancel_flag(job_id)
+                return False
 
             job = _job_queue.create(printer_name, job_type, options, '(Pulled from Hub)', job_id=job_id)
-            
+
             success = False
             error_msg = ''
-            
-            for attempt in range(max_retries + 1):
-                try:
-                    if job_type == 'pdf':
-                        # PASS BASE64 STRING DIRECTLY (Fixing double-decoding bug)
-                        success, error_msg = printer.print_pdf(printer_name, b64_data, options)
-                    else:
-                        # For raw, we use the decoded bytes
-                        success, error_msg = printer.print_raw(printer_name, raw_data, options)
-                        
-                    if success:
+
+            # Set printing flag
+            _set_printing(True)
+
+            try:
+                for attempt in range(max_retries):
+                    # Check cancel flag before each attempt
+                    if _check_cancelled(job_id):
+                        log.info("Job %s cancelled (attempt %d)", job_id, attempt + 1)
+                        error_msg = 'Cancelled'
+                        success = False
                         break
-                except Exception as e:
-                    success = False
-                    error_msg = str(e)
-                    
-                if not success and attempt < max_retries:
-                    log.warning("Print failed. Retrying in %ds... (%d/%d)", retry_delay, attempt+1, max_retries)
-                    time.sleep(retry_delay)
+
+                    try:
+                        if job_type == 'pdf':
+                            success, error_msg = printer.print_pdf(printer_name, b64_data, options)
+                        else:
+                            success, error_msg = printer.print_raw(printer_name, raw_data, options)
+
+                        if success:
+                            break
+                    except Exception as e:
+                        success = False
+                        error_msg = str(e)
+
+                    if not success and attempt < max_retries - 1:
+                        # Check cancel flag during retry delay (poll every 1s)
+                        log.warning("Print failed. Retrying in %ds... (%d/%d)", retry_delay, attempt + 1, max_retries)
+                        for _ in range(retry_delay):
+                            if _check_cancelled(job_id):
+                                log.info("Job %s cancelled during retry wait", job_id)
+                                error_msg = 'Cancelled'
+                                success = False
+                                break
+                            time.sleep(1)
+                        if error_msg == 'Cancelled':
+                            break
+            finally:
+                _set_printing(False)
 
             _job_queue.complete(job_id, success, error_msg)
+            _cleanup_cancel_flag(job_id)
+
+            if success:
+                if _notification_callback:
+                    _notification_callback("Hub Print Success", f"Printed on {printer_name}")
+            elif error_msg == 'Cancelled':
+                # Don't retry cancelled jobs
+                if _notification_callback:
+                    _notification_callback("Hub Print Cancelled", f"Cancelled job on {printer_name}")
+            else:
+                # All retries exhausted — move to retry queue for later
+                retry_queue.put(job_data)
+                if _notification_callback:
+                    _notification_callback("Hub Print Failed", f"Failed on {printer_name}: {error_msg}")
+
             report_job_to_hub(hub_url, agent_key, _job_queue.get(job_id))
-            _internal_print_queue.task_done()
+            return success
+
+        while True:
+            # Process retry queue items first (non-blocking)
+            retry_items = []
+            while not retry_queue.empty():
+                try:
+                    retry_items.append(retry_queue.get_nowait())
+                except _queue.Empty:
+                    break
+
+            for job_data in retry_items:
+                log.info("Retrying previously failed job %s", job_data.get('job_id', 'unknown'))
+                _process_job(job_data)
+
+            # Process new jobs from hub (non-blocking with timeout)
+            try:
+                hub_job = _internal_print_queue.get(timeout=1)
+                _process_job(hub_job)
+                _internal_print_queue.task_done()
+            except _queue.Empty:
+                time.sleep(1)
 
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=spooler_loop, daemon=True).start()
@@ -242,15 +558,20 @@ def report_status_to_hub(hub_url, agent_key):
         printers_list = printer.get_printers()
         global _cached_printer_count
         _cached_printer_count = len(printers_list)
-        
+
         payload = {
             'printers': [p['name'] for p in printers_list]
         }
         resp = requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
         global _hub_last_status
         if resp.status_code == 200:
-            _hub_last_status = "Connected"
-            log.info("Reported %d printers to hub", len(printers_list))
+            json_data = resp.json()
+            data = _check_hub_response(json_data, "status report")
+            if data is not None:
+                _hub_last_status = "Connected"
+                log.info("Reported %d printers to hub", len(printers_list))
+            else:
+                _hub_last_status = "Offline (API error)"
         else:
             _hub_last_status = f"Offline ({resp.status_code})"
             log.warning("Hub rejected status report (HTTP %d): %s", resp.status_code, resp.text)
@@ -276,7 +597,10 @@ def report_job_to_hub(hub_url, agent_key, job):
                 'created_at': job['created_at'],
                 'completed_at': job['completed_at'],
             }
-            requests.post(f'{hub_url}/api/print-hub/jobs', json=payload, headers=headers, timeout=10)
+            resp = requests.post(f'{hub_url}/api/print-hub/jobs', json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                json_data = resp.json()
+                _check_hub_response(json_data, "job report")
         except Exception as e:
             log.debug("Failed to report job to hub: %s", e)
 
@@ -287,8 +611,15 @@ def report_job_to_hub(hub_url, agent_key, job):
 #  Flask App Factory
 # ─────────────────────────────────────────────
 
+def get_resource_path(relative_path):
+    import sys
+    import os
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
+
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, template_folder=get_resource_path('templates'))
 
     # Load settings
     config_path = os.path.join(get_root_dir(), 'config.json')
@@ -300,8 +631,39 @@ def create_app():
     except Exception as e:
         log.error("Error loading config.json: %s", e)
 
-    allowed_origins = config_data.get('allowed_origins', ['*'])
-    CORS(app, origins=allowed_origins)
+    global _allowed_origins
+    _allowed_origins = config_data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
+
+    @app.before_request
+    def handle_options():
+        if request.method == 'OPTIONS':
+            resp = app.response_class()
+            resp.status_code = 204
+            return resp
+
+    @app.after_request
+    def add_cors_headers(response):
+        origin = request.headers.get('Origin')
+        if not origin:
+            return response
+
+        import re
+        allowed = False
+        for allowed_origin in _allowed_origins:
+            if allowed_origin == '*':
+                allowed = True
+                break
+            pattern = "^" + re.escape(allowed_origin).replace("\\*", ".*") + "$"
+            if re.match(pattern, origin):
+                allowed = True
+                break
+
+        if allowed:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-API-Key, X-Agent-Key'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, DELETE, OPTIONS'
+
+        return response
 
     # Load local profiles
     load_profiles_from_config()
@@ -323,7 +685,14 @@ def create_app():
 
     @app.route('/status', methods=['GET'])
     def status():
-        return jsonify({"status": "running", "version": "2.0.0"}), 200
+        pending = len([j for j in _job_queue.list_recent(50) if j['status'] == 'pending'])
+        uptime = int(time.time() - START_TIME)
+        return jsonify({
+            "status": "running",
+            "version": APP_VERSION,
+            "uptime_seconds": uptime,
+            "pending_jobs": pending
+        }), 200
 
     @app.route('/printers', methods=['GET'])
     def list_printers():
@@ -331,8 +700,9 @@ def create_app():
         return jsonify({"printers": printers_list}), 200
 
     @app.route('/profiles', methods=['GET'])
+    @app.route('/queues', methods=['GET'])
     def list_profiles():
-        return jsonify({"profiles": get_profiles()}), 200
+        return jsonify({"profiles": get_profiles(), "queues": get_profiles()}), 200
 
     @app.route('/print', methods=['POST'])
     def handle_print():
@@ -344,17 +714,24 @@ def create_app():
         raw_data = data.get('data')
         job_type = data.get('type', 'raw')
         options = data.get('options', {})
-        profile_name = data.get('profile')
+        queue_name = data.get('queue') or data.get('profile')
 
         # Resolve profile if specified
-        if profile_name and profile_name in _profiles:
-            profile = _profiles[profile_name]
+        if queue_name and queue_name in _profiles:
+            profile = _profiles[queue_name]
             if not printer_name:
                 printer_name = profile.get('printer', '')
-            # Merge profile options (profile is base, request overrides)
-            merged = {**profile.get('options', {}), **options}
+            # Profile fields are at top level; filter out metadata keys,
+            # use profile fields as base, request-level options override
+            meta_keys = {'id', 'name', 'printer', 'description', 'print_agent_id'}
+            profile_opts = {k: v for k, v in profile.items() if k not in meta_keys and v is not None}
+            merged = {**profile_opts, **options}
             options = merged
-            log.info("Using profile '%s' → printer=%s, options=%s", profile_name, printer_name, options)
+            log.info("Using queue '%s' → printer=%s, options=%s", queue_name, printer_name, options)
+
+        # Merge per-printer saved config (local defaults) — profile/request values override
+        if printer_name:
+            options = merge_printer_config(printer_name, options)
 
         if not printer_name or not raw_data:
             return jsonify({"error": "Missing 'printer' or 'data' in payload."}), 400
@@ -364,13 +741,22 @@ def create_app():
         job = _job_queue.create(printer_name, job_type, options, preview)
         _job_queue.store_job_data(job['id'], raw_data)
 
-        # Execute
-        if job_type == 'pdf':
-            success, error_msg = printer.print_pdf(printer_name, raw_data, options)
-        else:
-            success, error_msg = printer.print_raw(printer_name, raw_data, options)
+        # Execute with printing flag
+        _set_printing(True)
+        try:
+            if job_type == 'pdf':
+                success, error_msg = printer.print_pdf(printer_name, raw_data, options)
+            else:
+                success, error_msg = printer.print_raw(printer_name, raw_data, options)
+        finally:
+            _set_printing(False)
 
         _job_queue.complete(job['id'], success, error_msg)
+        if _notification_callback:
+            if success:
+                _notification_callback("Local Print Success", f"Printed on {printer_name}")
+            else:
+                _notification_callback("Local Print Failed", f"Failed on {printer_name}: {error_msg}")
 
         # Report to hub if configured
         if app.config['HUB_URL']:
@@ -417,226 +803,48 @@ def create_app():
             success, error_msg = printer.print_raw(job['printer'], raw_data, job.get('options'))
 
         _job_queue.complete(job_id, success, error_msg)
+        if _notification_callback:
+            if success:
+                _notification_callback("Retry Print Success", f"Printed on {printer_name}")
+            else:
+                _notification_callback("Retry Print Failed", f"Failed on {printer_name}: {error_msg}")
 
         if success:
             return jsonify({"status": "success", "message": "Retry successful"}), 200
         else:
             return jsonify({"status": "error", "error": error_msg}), 500
 
-    # ── Web Settings Dashboard ──
+    @app.route('/jobs/<job_id>/cancel', methods=['POST'])
+    def cancel_job_route(job_id):
+        """Cancel a pending or in-progress print job."""
+        job = _job_queue.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
 
-    @app.route('/settings', methods=['GET'])
-    def settings_page():
-        config = {}
-        try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        except:
-            pass
+        if job['status'] not in ('pending',):
+            return jsonify({"error": f"Cannot cancel job with status '{job['status']}'"}), 400
 
-        printers_list = printer.get_printers()
-        jobs = _job_queue.list_recent(20)
-        clean_jobs = [{k: v for k, v in j.items() if not k.startswith('_')} for j in jobs]
+        cancelled = cancel_job(job_id)
+        if cancelled:
+            # If it's pending, mark it as cancelled immediately
+            if job['status'] == 'pending':
+                _job_queue.complete(job_id, False, 'Cancelled')
+                _cleanup_cancel_flag(job_id)
+                if _notification_callback:
+                    _notification_callback("Job Cancelled", f"Cancelled job {job_id}")
 
-        hub_status = "Not configured"
-        hub_color = "#8b8fa3"
-        if config.get('hub_url'):
-            try:
-                import requests as req
-                headers = {'Authorization': f'Bearer {config.get("agent_key", "")}'}
-                resp = req.get(f'{config["hub_url"]}/api/print-hub/profiles', headers=headers, timeout=3)
-                if resp.status_code == 200:
-                    hub_status = f"Connected ({len(resp.json().get('profiles', {}))} profiles)"
-                    hub_color = "#22c55e"
-                elif resp.status_code == 401:
-                    hub_status = "Auth failed - check Agent Key"
-                    hub_color = "#ef4444"
-                else:
-                    hub_status = f"Error (HTTP {resp.status_code})"
-                    hub_color = "#ef4444"
-            except:
-                hub_status = "Cannot reach hub"
-                hub_color = "#f59e0b"
+            return jsonify({"status": "cancelled", "job_id": job_id}), 200
+        else:
+            return jsonify({"error": "Failed to cancel job"}), 500
 
-        return f'''<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trayprint Settings</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-:root {{ --bg:#0f1117; --surface:#1a1d27; --border:#2a2e3f; --text:#e4e6ed; --muted:#8b8fa3; --primary:#6366f1; --success:#22c55e; --danger:#ef4444; --warning:#f59e0b; }}
-* {{ margin:0;padding:0;box-sizing:border-box; }}
-body {{ font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);padding:2rem;max-width:900px;margin:0 auto; }}
-h1 {{ font-size:1.8rem;font-weight:700;background:linear-gradient(135deg,var(--primary),#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.25rem; }}
-.sub {{ color:var(--muted);font-size:.85rem;margin-bottom:2rem; }}
-.card {{ background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.5rem;margin-bottom:1.5rem; }}
-.card h2 {{ font-size:1rem;font-weight:600;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem; }}
-.grid {{ display:grid;grid-template-columns:1fr 1fr;gap:1rem; }}
-label {{ display:block;font-size:.8rem;font-weight:500;color:var(--muted);margin-bottom:.3rem; }}
-input,select {{ width:100%;padding:.55rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;font-family:inherit; }}
-input:focus {{ outline:none;border-color:var(--primary); }}
-.btn {{ display:inline-flex;align-items:center;gap:.4rem;padding:.6rem 1.2rem;border-radius:6px;font-size:.85rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;text-decoration:none; }}
-.btn-primary {{ background:var(--primary);color:white; }}
-.btn-primary:hover {{ background:#818cf8; }}
-.btn-secondary {{ background:var(--border);color:var(--text); }}
-.btn-secondary:hover {{ background:#353952; }}
-.badge {{ display:inline-block;padding:.15rem .5rem;border-radius:100px;font-size:.7rem;font-weight:600; }}
-.badge-ok {{ background:rgba(34,197,94,.15);color:var(--success); }}
-.badge-err {{ background:rgba(239,68,68,.15);color:var(--danger); }}
-.badge-warn {{ background:rgba(245,158,11,.15);color:var(--warning); }}
-.badge-info {{ background:rgba(99,102,241,.15);color:var(--primary); }}
-table {{ width:100%;border-collapse:collapse;font-size:.85rem; }}
-th {{ text-align:left;padding:.6rem .75rem;color:var(--muted);font-weight:500;font-size:.75rem;text-transform:uppercase;border-bottom:1px solid var(--border); }}
-td {{ padding:.6rem .75rem;border-bottom:1px solid var(--border); }}
-tr:hover {{ background:rgba(99,102,241,.04); }}
-.mono {{ font-family:monospace;font-size:.8rem;background:var(--bg);padding:.15rem .4rem;border-radius:3px; }}
-.dot {{ display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px; }}
-.dot-g {{ background:var(--success);box-shadow:0 0 6px var(--success); }}
-.dot-r {{ background:var(--danger); }}
-.msg {{ padding:.75rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:.85rem;display:none; }}
-.form-group {{ margin-bottom:1rem; }}
-</style>
-</head><body>
-
-<h1>Trayprint Settings</h1>
-<p class="sub">v2.0.0 &middot; Local Print Service running on port {config.get("port", 49211)}</p>
-
-<div id="msg" class="msg"></div>
-
-<!-- Hub Connection -->
-<div class="card">
-  <h2>Hub Connection <span class="badge {"badge-ok" if hub_color=="#22c55e" else "badge-err" if hub_color=="#ef4444" else "badge-warn"}" style="margin-left:auto;">{hub_status}</span></h2>
-  <form id="settingsForm">
-    <div class="grid">
-      <div class="form-group">
-        <label>Print Hub URL</label>
-        <input type="text" name="hub_url" id="hub_url" value="{config.get("hub_url","")}" placeholder="http://192.168.1.100:8082">
-      </div>
-      <div class="form-group">
-        <label>Agent Key</label>
-        <input type="text" name="agent_key" id="agent_key" value="{config.get("agent_key","")}" placeholder="Paste from Hub > Agents page">
-      </div>
-    </div>
-    <div class="grid">
-      <div class="form-group">
-        <label>Local Port</label>
-        <input type="number" name="port" id="port" value="{config.get("port", 49211)}">
-      </div>
-      <div class="form-group">
-        <label>Sync Interval (seconds)</label>
-        <input type="number" name="sync_interval_seconds" id="sync_interval" value="{config.get("sync_interval_seconds", 300)}">
-      </div>
-      <div class="form-group">
-        <label>Max Retries (Print Queue)</label>
-        <input type="number" name="max_retries" id="max_retries" value="{config.get("max_retries", 3)}">
-      </div>
-      <div class="form-group">
-        <label>Retry Delay (seconds)</label>
-        <input type="number" name="retry_delay_seconds" id="retry_delay_seconds" value="{config.get("retry_delay_seconds", 60)}">
-      </div>
-    </div>
-    <button type="submit" class="btn btn-primary">Save Settings</button>
-    <button type="button" class="btn btn-secondary" onclick="testConnection()" id="testBtn">Test Connection</button>
-  </form>
-</div>
-
-<!-- Printers -->
-<div class="card">
-  <h2>Local Printers ({len(printers_list)})</h2>
-  <table>
-    <thead><tr><th>Printer</th><th>Default</th><th>Status</th></tr></thead>
-    <tbody>
-    {"".join(f'<tr><td><strong>{p["name"]}</strong></td><td>{"<span class=badge badge-ok>DEFAULT</span>" if p["is_default"] else ""}</td><td><span class="badge badge-info">{p["status"]}</span></td></tr>' for p in printers_list) if printers_list else '<tr><td colspan=3 style="color:var(--muted)">No printers found</td></tr>'}
-    </tbody>
-  </table>
-</div>
-
-<!-- Recent Jobs -->
-<div class="card">
-  <h2>Recent Jobs ({len(clean_jobs)})</h2>
-  <table>
-    <thead><tr><th>ID</th><th>Printer</th><th>Type</th><th>Status</th><th>Time</th></tr></thead>
-    <tbody>
-    {"".join(f'<tr><td class="mono">{j["id"]}</td><td>{j["printer"]}</td><td><span class="badge badge-info">{j["type"].upper()}</span></td><td><span class="badge {"badge-ok" if j["status"]=="success" else "badge-err"}">{j["status"]}</span></td><td style="color:var(--muted)">{j["created_at"][11:19] if j.get("created_at") else ""}</td></tr>' for j in reversed(clean_jobs)) if clean_jobs else '<tr><td colspan=5 style="color:var(--muted)">No jobs yet</td></tr>'}
-    </tbody>
-  </table>
-</div>
-
-<script>
-const msg = document.getElementById('msg');
-function showMsg(text, ok) {{
-  msg.style.display='block';
-  msg.style.background=ok?'rgba(34,197,94,.1)':'rgba(239,68,68,.1)';
-  msg.style.color=ok?'#22c55e':'#ef4444';
-  msg.style.border='1px solid '+(ok?'rgba(34,197,94,.2)':'rgba(239,68,68,.2)');
-  msg.textContent=text;
-}}
-document.getElementById('settingsForm').addEventListener('submit', function(e) {{
-  e.preventDefault();
-  fetch('/settings/save', {{
-    method:'POST', headers:{{'Content-Type':'application/json'}},
-    body: JSON.stringify({{
-      hub_url: document.getElementById('hub_url').value.replace(/\\/+$/,''),
-      agent_key: document.getElementById('agent_key').value,
-      port: parseInt(document.getElementById('port').value) || 49211,
-      sync_interval_seconds: parseInt(document.getElementById('sync_interval').value) || 300,
-      max_retries: parseInt(document.getElementById('max_retries').value) || 3,
-      retry_delay_seconds: parseInt(document.getElementById('retry_delay_seconds').value) || 60
-    }})
-  }}).then(r=>r.json()).then(d=>{{ showMsg(d.message || 'Saved!', d.status==='ok'); }}).catch(()=>showMsg('Error saving',false));
-}});
-function testConnection() {{
-  const btn=document.getElementById('testBtn');
-  btn.textContent='Testing...'; btn.disabled=true;
-  const hub=document.getElementById('hub_url').value.replace(/\\/+$/,'');
-  const key=document.getElementById('agent_key').value;
-  fetch('/settings/test', {{
-    method:'POST', headers:{{'Content-Type':'application/json'}},
-    body: JSON.stringify({{ hub_url:hub, agent_key:key }})
-  }}).then(r=>r.json()).then(d=>{{ showMsg(d.message, d.status==='ok'); btn.textContent='Test Connection'; btn.disabled=false; }}).catch(()=>{{ showMsg('Network error',false); btn.textContent='Test Connection'; btn.disabled=false; }});
-}}
-</script>
-</body></html>'''
-
-    @app.route('/settings/save', methods=['POST'])
-    def settings_save():
-        data = request.get_json()
-        try:
-            cfg = {}
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path, 'r') as f:
-                        cfg = json.load(f)
-                except Exception:
-                    pass
-            cfg.update(data)
-            with open(config_path, 'w') as f:
-                json.dump(cfg, f, indent=2)
-            log.info("Settings saved via web UI")
-            return jsonify({"status": "ok", "message": "Settings saved! Restart Trayprint to apply."})
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
-
-    @app.route('/settings/test', methods=['POST'])
-    def settings_test():
-        data = request.get_json()
-        hub_url = data.get('hub_url', '')
-        agent_key = data.get('agent_key', '')
-        if not hub_url or not agent_key:
-            return jsonify({"status": "error", "message": "Hub URL and Agent Key are required."})
-        try:
-            import requests as req
-            headers = {'Authorization': f'Bearer {agent_key}'}
-            resp = req.get(f'{hub_url}/api/print-hub/profiles', headers=headers, timeout=5)
-            if resp.status_code == 200:
-                count = len(resp.json().get('profiles', {}))
-                return jsonify({"status": "ok", "message": f"Connected! {count} profile(s) found."})
-            elif resp.status_code == 401:
-                return jsonify({"status": "error", "message": "Invalid Agent Key."})
-            else:
-                return jsonify({"status": "error", "message": f"Hub returned HTTP {resp.status_code}"})
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Cannot reach hub: {e}"})
+    @app.route('/queue-status', methods=['GET'])
+    def queue_status_route():
+        """Return the current queue status for the tray UI."""
+        jobs = get_queue_status()
+        return jsonify({
+            "jobs": jobs,
+            "is_printing": is_printing()
+        }), 200
 
     return app
 
@@ -647,12 +855,12 @@ def run_server(port):
     werkzeug_log = stdlib_logging.getLogger('werkzeug')
     werkzeug_log.setLevel(stdlib_logging.ERROR)
     log.info("Starting API server on 127.0.0.1:%d", port)
-    
+
     # Perform an initial printer check to populate the cache
     try:
         # Pre-populate printer list for the local UI even without hub
         printer.get_printers()
-    except:
+    except Exception:
         pass
 
     app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)

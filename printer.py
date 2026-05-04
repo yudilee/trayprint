@@ -51,7 +51,20 @@ def get_printers():
             for info in printer_info:
                 name = info['pPrinterName']
                 status_code = info.get('Status', 0)
-                status = 'idle' if status_code == 0 else f'status:{status_code}'
+                
+                status_list = []
+                if status_code == 0:
+                    status = 'Ready'
+                else:
+                    if status_code & 128: status_list.append("Offline")
+                    if status_code & 8: status_list.append("Paper Jam")
+                    if status_code & 16: status_list.append("Out of Paper")
+                    if status_code & 2: status_list.append("Error")
+                    if status_code & 1: status_list.append("Paused")
+                    if status_code & 131072: status_list.append("Toner Low")
+                    if status_code & 1024: status_list.append("Printing")
+                    status = ", ".join(status_list) if status_list else f"Code {status_code}"
+
                 printers.append({
                     'name': name,
                     'is_default': (name == default_name),
@@ -88,7 +101,7 @@ def get_default_printer():
         try:
             import win32print
             return win32print.GetDefaultPrinter()
-        except:
+        except Exception:
             return ''
     else:
         try:
@@ -96,7 +109,7 @@ def get_default_printer():
             # Output: "system default destination: PRINTER_NAME"
             if result.returncode == 0 and ':' in result.stdout:
                 return result.stdout.split(':')[-1].strip()
-        except:
+        except Exception:
             pass
     return ''
 
@@ -164,6 +177,61 @@ def _build_lp_options(options):
     page_range = options.get('page_range')
     if page_range:
         args += ['-o', f'page-ranges={page_range}']
+
+    # ─────────────────────────────────────────────
+    # 7. Tray Source (InputSlot)
+    # ─────────────────────────────────────────────
+    tray_source = options.get('tray_source')
+    if tray_source:
+        # CUPS InputSlot values typically match the tray name
+        # e.g., "AutoSelect", "Tray1", "Tray2", "ManualFeed"
+        args += ['-o', f'InputSlot={tray_source}']
+        log.debug("CUPS: InputSlot=%s", tray_source)
+
+    # ─────────────────────────────────────────────
+    # 8. Color Mode
+    # ─────────────────────────────────────────────
+    color_mode = options.get('color_mode')
+    if color_mode == 'monochrome':
+        args += ['-o', 'ColorModel=Gray']
+        log.debug("CUPS: ColorModel=Gray")
+    elif color_mode == 'color':
+        args += ['-o', 'ColorModel=RGB']
+        log.debug("CUPS: ColorModel=RGB")
+
+    # ─────────────────────────────────────────────
+    # 9. Print Quality (IPP values)
+    # ─────────────────────────────────────────────
+    # IPP print-quality: 3=draft, 4=normal, 5=high
+    quality_map = {'draft': '3', 'normal': '4', 'high': '5'}
+    print_quality = options.get('print_quality')
+    if print_quality and print_quality in quality_map:
+        args += ['-o', f'print-quality={quality_map[print_quality]}']
+        log.debug("CUPS: print-quality=%s", quality_map[print_quality])
+
+    # ─────────────────────────────────────────────
+    # 10. Media Type
+    # ─────────────────────────────────────────────
+    media_type = options.get('media_type')
+    if media_type:
+        args += ['-o', f'media-type={media_type}']
+        log.debug("CUPS: media-type=%s", media_type)
+
+    # ─────────────────────────────────────────────
+    # 11. Collate
+    # ─────────────────────────────────────────────
+    collate = options.get('collate')
+    if collate is not None:
+        args += ['-o', f'Collate={str(collate).lower()}']
+        log.debug("CUPS: Collate=%s", str(collate).lower())
+
+    # ─────────────────────────────────────────────
+    # 12. Reverse Order
+    # ─────────────────────────────────────────────
+    reverse_order = options.get('reverse_order')
+    if reverse_order:
+        args += ['-o', 'OutputOrder=reverse']
+        log.debug("CUPS: OutputOrder=reverse")
 
     return args
 
@@ -306,7 +374,7 @@ def windows_printer_override(printer_name, options):
         # Use PRINTER_ALL_ACCESS if possible, or fall back to PRINTER_ACCESS_ADMINISTER | PRINTER_ACCESS_USE
         try:
             hprinter = win32print.OpenPrinter(printer_name, {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
-        except:
+        except Exception:
             hprinter = win32print.OpenPrinter(printer_name, {"DesiredAccess": win32con.PRINTER_ACCESS_ADMINISTER | win32con.PRINTER_ACCESS_USE})
             
         try:
@@ -365,10 +433,12 @@ def windows_printer_override(printer_name, options):
 
 
 def _build_sumatra_options(options, printer_name=None):
-    """Builds SumatraPDF -print-settings string."""
+    """Builds SumatraPDF -print-settings string and color flags."""
     parts = []
+    extra_args = []
+    
     if not options:
-        return parts
+        return extra_args
 
     copies = options.get('copies')
     if copies and int(copies) > 1:
@@ -414,9 +484,23 @@ def _build_sumatra_options(options, printer_name=None):
     if options.get('fit_to_page'):
         parts.append('fit')
 
+    # Reverse order — Sumatra uses 'rev' in print-settings
+    if options.get('reverse_order'):
+        parts.append('rev')
+        log.debug("SumatraPDF: reverse order enabled")
+
+    # Color mode — use -color or -grayscale flag (separate from -print-settings)
+    color_mode = options.get('color_mode')
+    if color_mode == 'monochrome':
+        extra_args.append('-grayscale')
+        log.debug("SumatraPDF: grayscale mode")
+    elif color_mode == 'color':
+        extra_args.append('-color')
+        log.debug("SumatraPDF: color mode")
+
     if parts:
-        return ['-print-settings', ','.join(parts)]
-    return []
+        return ['-print-settings', ','.join(parts)] + extra_args
+    return extra_args
 
 
 # ─────────────────────────────────────────────
@@ -433,7 +517,7 @@ def print_raw(printer_name, data_str, options=None):
     if isinstance(data_str, str):
         try:
             raw_bytes = data_str.encode('utf-8')
-        except:
+        except Exception:
             raw_bytes = data_str.encode('latin-1', errors='replace')
     else:
         raw_bytes = data_str
@@ -446,20 +530,34 @@ def print_raw(printer_name, data_str, options=None):
             # Open printer with write access
             hprinter = win32print.OpenPrinter(printer_name)
             try:
-                # If we have custom size options, try to set the DevMode
-                if options and (options.get('paper_width_mm') or options.get('paper_height_mm') or options.get('orientation')):
+                # If we have custom options, try to set the DevMode
+                has_devmode_opts = any([
+                    options.get('paper_width_mm'),
+                    options.get('paper_height_mm'),
+                    options.get('orientation'),
+                    options.get('tray_source'),
+                    options.get('color_mode'),
+                    options.get('print_quality'),
+                    options.get('collate') is not None,
+                    options.get('copies'),
+                    options.get('media_type'),
+                ])
+                if options and has_devmode_opts:
                     try:
                         # Get default DevMode
                         pinfo = win32print.GetPrinter(hprinter, 2)
                         devmode = pinfo['pDevMode']
                         
                         modified = False
+                        
                         # Orientation (1=Portrait, 2=Landscape)
                         if options.get('orientation') == 'landscape':
                             devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                            devmode.Fields |= win32con.DM_ORIENTATION
                             modified = True
                         elif options.get('orientation') == 'portrait':
                             devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                            devmode.Fields |= win32con.DM_ORIENTATION
                             modified = True
 
                         # Paper Size (Width/Height in 0.1mm units)
@@ -471,10 +569,72 @@ def print_raw(printer_name, data_str, options=None):
                             devmode.PaperLength = int(float(h) * 10)
                             devmode.Fields |= (win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
                             modified = True
+
+                        # ── Printer Control Fields ──
+                        
+                        # Default Source (Tray)
+                        tray_source = options.get('tray_source')
+                        if tray_source:
+                            devmode.DefaultSource = _tray_source_to_dmbin(tray_source)
+                            devmode.Fields |= win32con.DM_DEFAULTSOURCE
+                            modified = True
+                        
+                        # Color Mode
+                        color_mode = options.get('color_mode')
+                        if color_mode == 'monochrome':
+                            devmode.Color = 1  # DMCOLOR_MONOCHROME
+                            devmode.Fields |= win32con.DM_COLOR
+                            modified = True
+                        elif color_mode == 'color':
+                            devmode.Color = 2  # DMCOLOR_COLOR
+                            devmode.Fields |= win32con.DM_COLOR
+                            modified = True
+                        
+                        # Print Quality
+                        print_quality = options.get('print_quality')
+                        if print_quality:
+                            quality_map = {'draft': -1, 'low': -2, 'normal': -3, 'high': -4}
+                            pq = print_quality.lower()
+                            if pq in quality_map:
+                                devmode.PrintQuality = quality_map[pq]
+                                devmode.Fields |= win32con.DM_PRINTQUALITY
+                                modified = True
+                        
+                        # Collate
+                        collate = options.get('collate')
+                        if collate is not None:
+                            devmode.Collate = 1 if collate else 0
+                            devmode.Fields |= win32con.DM_COLLATE
+                            modified = True
+                        
+                        # Copies
+                        copies = options.get('copies')
+                        if copies:
+                            devmode.Copies = int(copies)
+                            devmode.Fields |= win32con.DM_COPIES
+                            modified = True
+                        
+                        # Media Type
+                        media_type = options.get('media_type')
+                        if media_type:
+                            media_map = {
+                                'plain': 1, 'transparency': 2, 'glossy': 3,
+                                'envelope': 4, 'labels': 6,
+                            }
+                            mt = media_type.lower()
+                            if mt in media_map:
+                                devmode.MediaType = media_map[mt]
+                                devmode.Fields |= win32con.DM_MEDIATYPE
+                                modified = True
                         
                         if modified:
                             # Update printer settings for this session
                             win32print.DocumentProperties(0, hprinter, printer_name, devmode, devmode, win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER)
+                            log.info("Raw print DevMode: Fields=%s, DefaultSource=%s, Color=%s, PrintQuality=%s, Collate=%s, Copies=%s, MediaType=%s",
+                                     devmode.Fields, getattr(devmode, 'DefaultSource', 'N/A'),
+                                     getattr(devmode, 'Color', 'N/A'), getattr(devmode, 'PrintQuality', 'N/A'),
+                                     getattr(devmode, 'Collate', 'N/A'), getattr(devmode, 'Copies', 'N/A'),
+                                     getattr(devmode, 'MediaType', 'N/A'))
                     except Exception as de:
                         log.warning("Could not set Windows DevMode: %s", de)
 
@@ -513,9 +673,42 @@ def print_raw(printer_name, data_str, options=None):
 #  PDF Printing
 # ─────────────────────────────────────────────
 
+def _tray_source_to_dmbin(tray_source_name):
+    """Map tray source display name to Windows DMBIN constant integer."""
+    tray_map = {
+        'AutoSelect': 7,    # DMBIN_AUTO
+        'Upper': 1,         # DMBIN_UPPER
+        'Tray1': 1,
+        'Lower': 2,         # DMBIN_LOWER
+        'Tray2': 2,
+        'Middle': 3,        # DMBIN_MIDDLE
+        'Tray3': 3,
+        'Manual': 4,        # DMBIN_MANUAL
+        'ManualFeed': 4,
+        'Envelope': 5,      # DMBIN_ENVELOPE
+        'EnvManual': 6,     # DMBIN_ENVMANUAL
+        'Auto': 7,          # DMBIN_AUTO
+        'Tractor': 8,       # DMBIN_TRACTOR
+        'SmallFmt': 9,      # DMBIN_SMALLFMT
+        'LargeFmt': 10,     # DMBIN_LARGEFMT
+        'LargeCapacity': 11,
+        'Cassette': 14,     # DMBIN_CASSETTE
+        'FormSource': 15,   # DMBIN_FORMSOURCE
+    }
+    # Try exact match, then case-insensitive fallback
+    if tray_source_name in tray_map:
+        return tray_map[tray_source_name]
+    lower_name = tray_source_name.lower()
+    for key, value in tray_map.items():
+        if key.lower() == lower_name:
+            return value
+    log.warning("Unknown tray source '%s', defaulting to AutoSelect (7)", tray_source_name)
+    return 7  # DMBIN_AUTO
+
+
 def _create_devmode_for_options(printer_name, options):
     """
-    Creates a DEVMODE structure with the correct paper size for win32print.
+    Creates a DEVMODE structure with paper size AND printer control fields for win32print.
     Returns (devmode, paper_name) or (None, None) on failure.
     """
     if not is_windows() or not options:
@@ -525,14 +718,30 @@ def _create_devmode_for_options(printer_name, options):
     h_mm = options.get('paper_height_mm')
     orientation = options.get('orientation')
     
+    # Check for printer control fields
+    tray_source = options.get('tray_source')
+    color_mode = options.get('color_mode')
+    print_quality = options.get('print_quality')
+    collate = options.get('collate')
+    copies = options.get('copies')
+    media_type = options.get('media_type')
+    
     # Nothing to customize
-    if not w_mm and not h_mm and not orientation:
+    has_paper = bool(w_mm or h_mm or orientation)
+    has_controls = any([
+        tray_source,
+        color_mode,
+        print_quality,
+        collate is not None,
+        copies,
+        media_type,
+    ])
+    if not has_paper and not has_controls:
         return None, None
     
     try:
         import win32print
         import win32con
-        import copy
         
         hprinter = win32print.OpenPrinter(printer_name)
         try:
@@ -540,7 +749,7 @@ def _create_devmode_for_options(printer_name, options):
             pinfo = win32print.GetPrinter(hprinter, 2)
             devmode = pinfo['pDevMode']
             log.info("Got default DevMode: PaperSize=%s, W=%s, H=%s, Orient=%s, Fields=%s",
-                     devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength, 
+                     devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength,
                      devmode.Orientation, devmode.Fields)
             
             paper_name = None
@@ -550,6 +759,8 @@ def _create_devmode_for_options(printer_name, options):
                 paper_name, paper_id = _find_windows_paper_name(printer_name, w_mm, h_mm)
             
             modified = False
+            
+            # ── Paper Size & Orientation ──
             
             # Set paper size by ID if found (e.g., custom "kuitansi" form)
             if paper_id:
@@ -588,21 +799,90 @@ def _create_devmode_for_options(printer_name, options):
                     devmode.Orientation = win32con.DMORIENT_PORTRAIT
                     devmode.Fields |= win32con.DM_ORIENTATION
                     modified = True
+
+            # ── Printer Control Fields (DEVMODE) ──
+            
+            # 1. Default Source (Tray)
+            if tray_source:
+                devmode.DefaultSource = _tray_source_to_dmbin(tray_source)
+                devmode.Fields |= win32con.DM_DEFAULTSOURCE
+                modified = True
+                log.info("DevMode: DefaultSource=%d (%s)", devmode.DefaultSource, tray_source)
+
+            # 2. Color Mode
+            if color_mode == 'monochrome':
+                devmode.Color = 1  # DMCOLOR_MONOCHROME
+                devmode.Fields |= win32con.DM_COLOR
+                modified = True
+                log.info("DevMode: Color=MONOCHROME (1)")
+            elif color_mode == 'color':
+                devmode.Color = 2  # DMCOLOR_COLOR
+                devmode.Fields |= win32con.DM_COLOR
+                modified = True
+                log.info("DevMode: Color=COLOR (2)")
+
+            # 3. Print Quality
+            if print_quality:
+                quality_map = {'draft': -1, 'low': -2, 'normal': -3, 'high': -4}
+                pq = print_quality.lower()
+                if pq in quality_map:
+                    devmode.PrintQuality = quality_map[pq]
+                    devmode.Fields |= win32con.DM_PRINTQUALITY
+                    modified = True
+                    log.info("DevMode: PrintQuality=%d (%s)", devmode.PrintQuality, pq)
+
+            # 4. Collate
+            if collate is not None:
+                devmode.Collate = 1 if collate else 0
+                devmode.Fields |= win32con.DM_COLLATE
+                modified = True
+                log.info("DevMode: Collate=%d", devmode.Collate)
+
+            # 5. Copies
+            if copies:
+                devmode.Copies = int(copies)
+                devmode.Fields |= win32con.DM_COPIES
+                modified = True
+                log.info("DevMode: Copies=%d", devmode.Copies)
+
+            # 6. Media Type
+            if media_type:
+                media_map = {
+                    'plain': 1,          # DMMEDIA_STANDARD
+                    'transparency': 2,   # DMMEDIA_TRANSPARENCY
+                    'glossy': 3,         # DMMEDIA_GLOSSY
+                    'envelope': 4,       # DMMEDIA_ENVELOPE
+                    'labels': 6,
+                }
+                mt = media_type.lower()
+                if mt in media_map:
+                    devmode.MediaType = media_map[mt]
+                    devmode.Fields |= win32con.DM_MEDIATYPE
+                    modified = True
+                    log.info("DevMode: MediaType=%d (%s)", devmode.MediaType, mt)
             
             if modified:
                 if paper_id:
-                    log.info("DevMode ready (no validation). PaperSize=%s, W=%s, H=%s, Orient=%s, Fields=%s",
-                             devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength, 
-                             devmode.Orientation, devmode.Fields)
+                    log.info("DevMode ready (no validation). PaperSize=%s, W=%s, H=%s, Orient=%s, "
+                             "DefaultSource=%s, Color=%s, PrintQuality=%s, Collate=%s, Copies=%s, MediaType=%s, Fields=%s",
+                             devmode.PaperSize, devmode.PaperWidth, devmode.PaperLength,
+                             devmode.Orientation, getattr(devmode, 'DefaultSource', 'N/A'),
+                             getattr(devmode, 'Color', 'N/A'), getattr(devmode, 'PrintQuality', 'N/A'),
+                             getattr(devmode, 'Collate', 'N/A'), getattr(devmode, 'Copies', 'N/A'),
+                             getattr(devmode, 'MediaType', 'N/A'), devmode.Fields)
                 else:
                     # For generic custom sizes, validate through DocumentProperties
                     result = win32print.DocumentProperties(
                         0, hprinter, printer_name, devmode, devmode,
                         win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER
                     )
-                    log.info("DevMode validated (result=%s). Final: PaperSize=%s, W=%s, H=%s, Orient=%s",
-                             result, devmode.PaperSize, devmode.PaperWidth, 
-                             devmode.PaperLength, devmode.Orientation)
+                    log.info("DevMode validated (result=%s). Final: PaperSize=%s, W=%s, H=%s, Orient=%s, "
+                             "DefaultSource=%s, Color=%s, PrintQuality=%s, Collate=%s, Copies=%s, MediaType=%s",
+                             result, devmode.PaperSize, devmode.PaperWidth,
+                             devmode.PaperLength, devmode.Orientation,
+                             getattr(devmode, 'DefaultSource', 'N/A'), getattr(devmode, 'Color', 'N/A'),
+                             getattr(devmode, 'PrintQuality', 'N/A'), getattr(devmode, 'Collate', 'N/A'),
+                             getattr(devmode, 'Copies', 'N/A'), getattr(devmode, 'MediaType', 'N/A'))
                 return devmode, paper_name
         finally:
             win32print.ClosePrinter(hprinter)
@@ -918,7 +1198,7 @@ def print_pdf(printer_name, pdf_base64, options=None):
             try:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
-            except:
+            except Exception:
                 pass
         threading.Thread(target=cleanup, daemon=True).start()
 

@@ -29,16 +29,27 @@ def build():
         '--hidden-import=flask',
         '--hidden-import=requests',
         '--hidden-import=PIL',
-        '--hidden-import=win32print',
-        '--hidden-import=win32con',
-        '--hidden-import=win32api',
-        '--hidden-import=win32ui',
         '--hidden-import=fitz',
+        '--hidden-import=ui_settings',
+        '--hidden-import=server',
+        '--hidden-import=autostart',
+        '--hidden-import=printer',
+        '--hidden-import=path_utils',
+        '--hidden-import=logger',
     ]
+    
+    if sys.platform == 'win32':
+        hidden_imports += [
+            '--hidden-import=win32print',
+            '--hidden-import=win32con',
+            '--hidden-import=win32api',
+            '--hidden-import=win32ui',
+        ]
 
     # Data files to include inside the bundle (read-only templates/icons)
     datas = [
         f'--add-data=config.json{os.pathsep}.',
+        f'--add-data=templates{os.pathsep}templates',
     ]
     
     binaries = []
