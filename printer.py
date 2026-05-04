@@ -3,6 +3,18 @@ import os
 import subprocess
 from logger import get_logger
 
+# Windows-specific imports
+try:
+    import win32print
+    import win32con
+    import win32api
+    import win32ui
+except ImportError:
+    win32print = None
+    win32con = None
+    win32api = None
+    win32ui = None
+
 log = get_logger()
 
 def is_windows():
@@ -44,26 +56,57 @@ def get_printers():
     default_name = get_default_printer()
 
     if is_windows():
+        if not win32print:
+            log.error("Windows printer support missing (win32print not imported)")
+            return []
+            
         try:
-            import win32print
-            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+            # Level 2 provides pPrinterName, pLocation, Status, etc.
+            # We use a broad set of flags to find local, network, and shared printers.
+            flags = (win32print.PRINTER_ENUM_LOCAL | 
+                     win32print.PRINTER_ENUM_CONNECTIONS | 
+                     win32print.PRINTER_ENUM_NETWORK)
+            
+            log.debug("Enumerating Windows printers with flags: %s", flags)
             printer_info = win32print.EnumPrinters(flags, None, 2)
+            
+            # Fallback for some environments (Level 5 is simpler/faster for local printers)
+            if not printer_info:
+                log.debug("EnumPrinters Level 2 returned 0, trying Level 5 fallback...")
+                printer_info = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL, None, 5)
+                # Level 5 has different keys, but we only need pPrinterName
+                for info in printer_info:
+                    name = info.get('pPrinterName') or info.get('PrinterName')
+                    if name:
+                        printers.append({
+                            'name': name,
+                            'is_default': (name == default_name),
+                            'status': 'Ready (L5)',
+                            'location': '',
+                        })
+                if printers:
+                    log.info("Found %d printer(s) via Level 5 fallback", len(printers))
+                    return printers
+
             for info in printer_info:
-                name = info['pPrinterName']
-                status_code = info.get('Status', 0)
+                name = info.get('pPrinterName')
+                if not name: continue
+                
+                status_code = info.get('Attributes', 0) # Use Attributes as a secondary source
+                status_bits = info.get('Status', 0)
                 
                 status_list = []
-                if status_code == 0:
+                if status_bits == 0:
                     status = 'Ready'
                 else:
-                    if status_code & 128: status_list.append("Offline")
-                    if status_code & 8: status_list.append("Paper Jam")
-                    if status_code & 16: status_list.append("Out of Paper")
-                    if status_code & 2: status_list.append("Error")
-                    if status_code & 1: status_list.append("Paused")
-                    if status_code & 131072: status_list.append("Toner Low")
-                    if status_code & 1024: status_list.append("Printing")
-                    status = ", ".join(status_list) if status_list else f"Code {status_code}"
+                    if status_bits & 128: status_list.append("Offline")
+                    if status_bits & 8: status_list.append("Paper Jam")
+                    if status_bits & 16: status_list.append("Out of Paper")
+                    if status_bits & 2: status_list.append("Error")
+                    if status_bits & 1: status_list.append("Paused")
+                    if status_bits & 131072: status_list.append("Toner Low")
+                    if status_bits & 1024: status_list.append("Printing")
+                    status = ", ".join(status_list) if status_list else f"Code {status_bits}"
 
                 printers.append({
                     'name': name,
@@ -72,7 +115,7 @@ def get_printers():
                     'location': info.get('pLocation', ''),
                 })
         except Exception as e:
-            log.error("Error enumerating windows printers: %s", e)
+            log.error("Error enumerating windows printers: %s", e, exc_info=True)
     else:
         try:
             result = subprocess.run(['lpstat', '-a'], capture_output=True, text=True, check=True)
@@ -98,8 +141,9 @@ def get_printers():
 def get_default_printer():
     """Returns the name of the OS default printer."""
     if is_windows():
+        if not win32print:
+            return ''
         try:
-            import win32print
             return win32print.GetDefaultPrinter()
         except Exception:
             return ''
@@ -245,11 +289,9 @@ def _find_windows_paper_name(printer_name, w_mm, h_mm):
     1. DeviceCapabilities DC_PAPERSIZE (works for most drivers)
     2. EnumForms API (fallback for drivers like Epson LQ that return 0x0 sizes)
     """
-    if not is_windows() or not printer_name:
+    if not is_windows() or not printer_name or not win32print:
         return None, None
     try:
-        import win32print
-        import win32con
         
         # Get paper names and IDs supported by this specific printer
         names = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERNAMES)
@@ -362,13 +404,11 @@ def windows_printer_override(printer_name, options):
     Context manager that temporarily overrides the printer's DEFAULT DevMode 
     at the OS level to force paper size, then restores it.
     """
-    if not is_windows() or not printer_name or not options:
+    if not is_windows() or not printer_name or not options or not win32print:
         yield
         return
 
     try:
-        import win32print
-        import win32con
         
         # Open printer with administrative access to change settings
         # Use PRINTER_ALL_ACCESS if possible, or fall back to PRINTER_ACCESS_ADMINISTER | PRINTER_ACCESS_USE
@@ -523,9 +563,9 @@ def print_raw(printer_name, data_str, options=None):
         raw_bytes = data_str
 
     if is_windows():
+        if not win32print:
+            return False, "Windows printer support missing"
         try:
-            import win32print
-            import win32con
             
             # Open printer with write access
             hprinter = win32print.OpenPrinter(printer_name)
@@ -711,7 +751,7 @@ def _create_devmode_for_options(printer_name, options):
     Creates a DEVMODE structure with paper size AND printer control fields for win32print.
     Returns (devmode, paper_name) or (None, None) on failure.
     """
-    if not is_windows() or not options:
+    if not is_windows() or not options or not win32print:
         return None, None
     
     w_mm = options.get('paper_width_mm')
@@ -740,8 +780,6 @@ def _create_devmode_for_options(printer_name, options):
         return None, None
     
     try:
-        import win32print
-        import win32con
         
         hprinter = win32print.OpenPrinter(printer_name)
         try:
