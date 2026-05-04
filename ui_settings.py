@@ -109,6 +109,12 @@ class SettingsWindow(QDialog):
         self.refresh_timer.timeout.connect(self.refresh_status)
         self.refresh_timer.start(5000)
 
+        # Thread-safe capability refresh via polled result variable
+        self._pending_capability_result = None
+        self._capability_poll_timer = QTimer(self)
+        self._capability_poll_timer.timeout.connect(self._process_pending_capability)
+        self._capability_poll_timer.start(200)  # Check for background-thread results every 200ms
+
     def load_config(self):
         try:
             if os.path.exists(self.config_path):
@@ -802,8 +808,10 @@ class SettingsWindow(QDialog):
         """Fetch capabilities for the selected printer and update dropdowns."""
         printer_name = self.lbl_selected_printer.text()
         if not printer_name or printer_name == "No printer selected":
+            log.debug("on_refresh_capabilities: no printer selected, skipping")
             return
 
+        log.info("on_refresh_capabilities: starting refresh for '%s'", printer_name)
         self.btn_refresh_caps.setEnabled(False)
         self.btn_refresh_caps.setText("Refreshing...")
 
@@ -812,90 +820,119 @@ class SettingsWindow(QDialog):
             try:
                 import capabilities as caps_mod
                 caps = caps_mod.discover_capabilities(printer_name)
-                # Schedule UI update back on main thread
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self._apply_capabilities_to_dropdowns(printer_name, caps))
+                # Store result for main-thread poll timer to pick up
+                # (Python GIL makes single-variable assignment atomic)
+                self._pending_capability_result = (printer_name, caps)
             except Exception as e:
-                QTimer.singleShot(0, lambda: self.btn_refresh_caps.setText("Refresh Capabilities"))
-                QTimer.singleShot(0, lambda: self.btn_refresh_caps.setEnabled(True))
-                log.error("Capability refresh failed for '%s': %s", printer_name, e)
-                QTimer.singleShot(0, lambda: QMessageBox.warning(
-                    self, "Capability Error",
-                    f"Failed to query capabilities for '{printer_name}':\n{e}"
-                ))
+                log.error("Capability refresh EXCEPTION for '%s': %s",
+                          printer_name, e, exc_info=True)
+                # Store error result so polling handler can reset UI
+                self._pending_capability_result = (printer_name, {'error': str(e)})
 
         import threading
         threading.Thread(target=_do_refresh, daemon=True).start()
 
+    def _process_pending_capability(self):
+        """Poll-timer callback (main thread): pick up background-thread results."""
+        result = self._pending_capability_result
+        if result is not None:
+            self._pending_capability_result = None
+            printer_name, caps = result
+            self._apply_capabilities_to_dropdowns(printer_name, caps)
+
     def _apply_capabilities_to_dropdowns(self, printer_name, capabilities):
         """Update PRINTER_CONTROL_FIELDS dropdown options from discovered capabilities."""
-        if 'error' in capabilities and capabilities['error']:
+        log.debug("_apply_capabilities_to_dropdowns ENTER: printer='%s', caps_keys=%s, caps_error=%s",
+                  printer_name, list(capabilities.keys()) if capabilities else 'NONE',
+                  capabilities.get('error', 'None') if capabilities else 'N/A')
+
+        # Guard: capabilities must be a dict
+        if not isinstance(capabilities, dict):
+            log.error("_apply_capabilities_to_dropdowns: capabilities is not a dict, got %s", type(capabilities).__name__)
             self.btn_refresh_caps.setText("Refresh Capabilities")
             self.btn_refresh_caps.setEnabled(True)
-            QMessageBox.warning(self, "Capability Error", capabilities['error'])
             return
 
-        updated_fields = 0
+        try:
+            if 'error' in capabilities and capabilities['error']:
+                log.warning("_apply_capabilities_to_dropdowns: capabilities contain error: %s", capabilities['error'])
+                self.btn_refresh_caps.setText("Refresh Capabilities")
+                self.btn_refresh_caps.setEnabled(True)
+                QMessageBox.warning(self, "Capability Error", capabilities['error'])
+                return
 
-        # ── Trays ──
-        trays = capabilities.get('trays', [])
-        if trays and 'tray_source' in self.printer_control_widgets:
-            w = self.printer_control_widgets['tray_source']
-            current_val = w.currentText()
-            w.clear()
-            w.addItems(trays)
-            idx = w.findText(current_val)
-            if idx >= 0:
-                w.setCurrentIndex(idx)
-            updated_fields += 1
+            updated_fields = 0
 
-        # ── Media Sizes (add to the existing fixed list or replace) ──
-        # We keep the original PRINTER_CONTROL_FIELDS as base and append discovered sizes
-        # For media_size we don't have a dedicated widget, but we log them
-        media_sizes = capabilities.get('media_sizes', [])
-        if media_sizes:
-            log.info("Discovered %d media sizes for '%s'", len(media_sizes), printer_name)
+            # ── Trays ──
+            trays = capabilities.get('trays', [])
+            log.debug("_apply_capabilities_to_dropdowns: trays=%s", trays)
+            if trays and 'tray_source' in self.printer_control_widgets:
+                w = self.printer_control_widgets['tray_source']
+                current_val = w.currentText()
+                w.clear()
+                w.addItems(trays)
+                idx = w.findText(current_val)
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+                updated_fields += 1
+                log.debug("_apply_capabilities_to_dropdowns: updated tray_source with %d items", len(trays))
 
-        # ── Resolutions ──
-        resolutions = capabilities.get('resolutions', [])
-        if resolutions and 'print_quality' in self.printer_control_widgets:
-            # Store resolutions in a hidden attribute for potential future use
-            self._cached_resolutions = resolutions
-            updated_fields += 1
+            # ── Media Sizes ──
+            media_sizes = capabilities.get('media_sizes', [])
+            if media_sizes:
+                log.info("Discovered %d media sizes for '%s'", len(media_sizes), printer_name)
 
-        # ── Color Modes ──
-        color_modes = capabilities.get('color_modes', [])
-        if color_modes and 'color_mode' in self.printer_control_widgets:
-            w = self.printer_control_widgets['color_mode']
-            current_val = w.currentText()
-            w.clear()
-            w.addItems(color_modes)
-            idx = w.findText(current_val)
-            if idx >= 0:
-                w.setCurrentIndex(idx)
-            updated_fields += 1
+            # ── Resolutions ──
+            resolutions = capabilities.get('resolutions', [])
+            log.debug("_apply_capabilities_to_dropdowns: resolutions=%s", resolutions)
+            if resolutions and 'print_quality' in self.printer_control_widgets:
+                self._cached_resolutions = resolutions
+                updated_fields += 1
+                log.debug("_apply_capabilities_to_dropdowns: cached %d resolutions", len(resolutions))
 
-        # ── Duplex ──
-        duplex = capabilities.get('duplex', [])
-        if duplex:
-            log.info("Discovered %d duplex modes for '%s'", len(duplex), printer_name)
-            # Store for potential future use
-            self._cached_duplex = duplex
+            # ── Color Modes ──
+            color_modes = capabilities.get('color_modes', [])
+            log.debug("_apply_capabilities_to_dropdowns: color_modes=%s", color_modes)
+            if color_modes and 'color_mode' in self.printer_control_widgets:
+                w = self.printer_control_widgets['color_mode']
+                current_val = w.currentText()
+                w.clear()
+                w.addItems(color_modes)
+                idx = w.findText(current_val)
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+                updated_fields += 1
+                log.debug("_apply_capabilities_to_dropdowns: updated color_mode with %d items", len(color_modes))
 
-        self.btn_refresh_caps.setText("Refresh Capabilities")
-        self.btn_refresh_caps.setEnabled(True)
+            # ── Duplex ──
+            duplex = capabilities.get('duplex', [])
+            if duplex:
+                log.info("Discovered %d duplex modes for '%s'", len(duplex), printer_name)
+                self._cached_duplex = duplex
 
-        if updated_fields > 0:
-            log.info("Updated capability dropdowns for '%s' (%d fields)", printer_name, updated_fields)
-            QMessageBox.information(
-                self, "Capabilities Updated",
-                f"Refreshed {updated_fields} capability fields for '{printer_name}'."
-            )
-        else:
-            QMessageBox.information(
-                self, "Capabilities",
-                f"No capability fields to update for '{printer_name}'."
-            )
+            log.debug("_apply_capabilities_to_dropdowns: resetting button (updated_fields=%d)", updated_fields)
+            self.btn_refresh_caps.setText("Refresh Capabilities")
+            self.btn_refresh_caps.setEnabled(True)
+
+            if updated_fields > 0:
+                log.info("Updated capability dropdowns for '%s' (%d fields)", printer_name, updated_fields)
+                QMessageBox.information(
+                    self, "Capabilities Updated",
+                    f"Refreshed {updated_fields} capability fields for '{printer_name}'."
+                )
+            else:
+                log.info("No capability fields to update for '%s'", printer_name)
+                QMessageBox.information(
+                    self, "Capabilities",
+                    f"No capability fields to update for '{printer_name}'."
+                )
+            log.debug("_apply_capabilities_to_dropdowns EXIT: success")
+
+        except Exception as e:
+            log.error("_apply_capabilities_to_dropdowns UNHANDLED EXCEPTION: %s", e, exc_info=True)
+            # Reset button regardless so it doesn't stay stuck
+            self.btn_refresh_caps.setText("Refresh Capabilities")
+            self.btn_refresh_caps.setEnabled(True)
 
     def on_save_printer_config(self):
         """Save the current control values for the selected printer."""
