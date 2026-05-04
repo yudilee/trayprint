@@ -55,6 +55,7 @@ def build():
     ]
     
     if sys.platform == 'win32':
+        icon_opt = ['--icon', os.path.join(app_dir, 'trayprint.ico')]
         hidden_imports += [
             '--hidden-import=win32print',
             '--hidden-import=win32con',
@@ -63,6 +64,19 @@ def build():
             '--hidden-import=win32timezone',
             '--hidden-import=pywintypes',
             '--hidden-import=pythoncom',
+        ]
+    elif sys.platform == 'darwin':
+        # macOS: .icns icon and macOS-specific hidden imports
+        icns_path = os.path.join(app_dir, 'trayprint.icns')
+        if os.path.exists(icns_path):
+            icon_opt = ['--icon', icns_path]
+        else:
+            print("! macOS .icns icon not found at %s — will use default", icns_path)
+        hidden_imports += [
+            '--hidden-import=platform_darwin',
+            '--hidden-import=objc',
+            '--hidden-import=CoreFoundation',
+            '--hidden-import=CoreGraphics',
         ]
 
     # Data files to include inside the bundle (read-only templates/icons)
@@ -95,6 +109,8 @@ def build():
     # Output location
     if sys.platform == 'win32':
         exe_name = 'trayprint.exe'
+    elif sys.platform == 'darwin':
+        exe_name = 'trayprint.app'  # macOS creates a .app bundle
     else:
         exe_name = 'trayprint'
 

@@ -1,284 +1,26 @@
 import os
 import json
+import threading
 import requests
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QLabel, QLineEdit, QPushButton, QSpinBox, QCheckBox, QComboBox,
     QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView,
     QFormLayout, QGroupBox, QFrame, QListWidget, QSplitter,
-    QScrollArea
+    QScrollArea, QProgressBar
 )
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont, QIcon, QColor, QPalette
 
 from path_utils import get_root_dir
+from logger import get_logger
+from theme import get_stylesheet, get_palette
 import server
 import autostart
 import printer
+import capabilities
 
-# ─────────────────────────────────────────────
-#  Theme Manager
-# ─────────────────────────────────────────────
-
-class ThemeManager:
-    LIGHT = {
-        'id': 'light', 'icon': '🌙', 'name': 'Light',
-        'bg': '#f8fafc', 'surface': '#ffffff', 'surface2': '#f1f5f9',
-        'border': '#e2e8f0', 'border_focus': '#3b82f6',
-        'text_primary': '#0f172a', 'text_secondary': '#475569', 'text_muted': '#94a3b8',
-        'accent': '#2563eb', 'accent_hover': '#1d4ed8', 'accent_pressed': '#1e40af',
-        'accent_disabled': '#93c5fd', 'accent_text': '#ffffff',
-        'accent_light': '#eff6ff', 'accent_light_text': '#1d4ed8',
-        'teal': '#0d9488', 'teal_hover': '#0f766e', 'teal_disabled': '#99f6e4',
-        'success': '#16a34a', 'error': '#dc2626', 'warning': '#d97706',
-        'tab_bg': '#f1f5f9', 'tab_text': '#475569',
-        'tab_active_bg': '#ffffff', 'tab_active_text': '#2563eb', 'tab_active_border': '#2563eb',
-        'input_bg': '#ffffff', 'input_disabled_bg': '#f1f5f9', 'input_disabled_text': '#94a3b8',
-        'list_bg': '#f8fafc', 'list_alt': '#f1f5f9', 'list_hover': '#e2e8f0',
-        'list_sel_bg': '#eff6ff', 'list_sel_text': '#2563eb',
-        'footer_bg': '#f1f5f9', 'scrollbar': '#cbd5e1', 'scrollbar_hover': '#94a3b8',
-        'splitter': '#e2e8f0', 'table_header': '#f8fafc', 'table_header_text': '#64748b',
-        'table_grid': '#f1f5f9', 'table_sel_bg': '#eff6ff', 'table_sel_text': '#1e40af',
-        'group_border': '#e2e8f0', 'group_title': '#374151', 'group_bg': '#ffffff',
-        'btn_bg': '#ffffff', 'btn_border': '#e2e8f0', 'btn_text': '#374151',
-        'btn_hover': '#f8fafc', 'btn_hover_border': '#94a3b8', 'btn_pressed': '#f1f5f9',
-        'checkbox_border': '#d1d5db', 'checkbox_bg': '#ffffff',
-    }
-
-    DARK = {
-        'id': 'dark', 'icon': '☀️', 'name': 'Dark',
-        'bg': '#0f172a', 'surface': '#1e293b', 'surface2': '#162032',
-        'border': '#334155', 'border_focus': '#60a5fa',
-        'text_primary': '#f1f5f9', 'text_secondary': '#94a3b8', 'text_muted': '#64748b',
-        'accent': '#3b82f6', 'accent_hover': '#60a5fa', 'accent_pressed': '#2563eb',
-        'accent_disabled': '#1e3a5f', 'accent_text': '#ffffff',
-        'accent_light': '#1e3a5f', 'accent_light_text': '#93c5fd',
-        'teal': '#14b8a6', 'teal_hover': '#2dd4bf', 'teal_disabled': '#134e4a',
-        'success': '#22c55e', 'error': '#f87171', 'warning': '#fbbf24',
-        'tab_bg': '#162032', 'tab_text': '#94a3b8',
-        'tab_active_bg': '#1e293b', 'tab_active_text': '#60a5fa', 'tab_active_border': '#3b82f6',
-        'input_bg': '#0f172a', 'input_disabled_bg': '#162032', 'input_disabled_text': '#475569',
-        'list_bg': '#0f172a', 'list_alt': '#162032', 'list_hover': '#1e293b',
-        'list_sel_bg': '#1e3a5f', 'list_sel_text': '#93c5fd',
-        'footer_bg': '#162032', 'scrollbar': '#334155', 'scrollbar_hover': '#475569',
-        'splitter': '#334155', 'table_header': '#162032', 'table_header_text': '#64748b',
-        'table_grid': '#1e293b', 'table_sel_bg': '#1e3a5f', 'table_sel_text': '#93c5fd',
-        'group_border': '#334155', 'group_title': '#94a3b8', 'group_bg': '#1e293b',
-        'btn_bg': '#1e293b', 'btn_border': '#334155', 'btn_text': '#e2e8f0',
-        'btn_hover': '#334155', 'btn_hover_border': '#475569', 'btn_pressed': '#162032',
-        'checkbox_border': '#475569', 'checkbox_bg': '#0f172a',
-    }
-
-    @staticmethod
-    def get(theme_id='light'):
-        return ThemeManager.DARK if theme_id == 'dark' else ThemeManager.LIGHT
-
-    @staticmethod
-    def build_stylesheet(t):
-        return f"""
-            QDialog {{ background: {t['bg']}; color: {t['text_primary']}; }}
-            QWidget {{ background: transparent; color: {t['text_primary']}; }}
-
-            QTabWidget::pane {{
-                border: 1px solid {t['border']}; border-radius: 10px;
-                padding: 10px; background: {t['surface']}; top: -1px;
-            }}
-            QTabWidget::tab-bar {{ left: 8px; }}
-            QTabBar::tab {{
-                padding: 10px 24px; margin-right: 4px;
-                border: 1px solid {t['border']}; border-bottom: none;
-                border-top-left-radius: 8px; border-top-right-radius: 8px;
-                background: {t['tab_bg']}; color: {t['tab_text']};
-                font-weight: 500; font-size: 13px;
-            }}
-            QTabBar::tab:hover:!selected {{ background: {t['surface2']}; color: {t['text_primary']}; }}
-            QTabBar::tab:selected {{
-                background: {t['tab_active_bg']}; color: {t['tab_active_text']};
-                font-weight: 700; border-color: {t['border']};
-                border-bottom: 3px solid {t['tab_active_border']};
-            }}
-
-            QGroupBox {{
-                font-weight: 700; font-size: 13px; color: {t['group_title']};
-                border: 1px solid {t['group_border']}; border-radius: 10px;
-                margin-top: 14px; padding: 18px 12px 12px 12px; background: {t['group_bg']};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; subcontrol-position: top left;
-                padding: 4px 12px; background: {t['group_bg']}; color: {t['group_title']};
-            }}
-
-            QLabel {{ color: {t['text_secondary']}; background: transparent; font-size: 13px; }}
-
-            QLineEdit, QSpinBox, QComboBox {{
-                padding: 8px 12px; border: 1.5px solid {t['border']};
-                border-radius: 7px; background: {t['input_bg']}; color: {t['text_primary']};
-                font-size: 13px; min-height: 22px;
-                selection-background-color: {t['accent']}; selection-color: {t['accent_text']};
-            }}
-            QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
-                border-color: {t['border_focus']}; background: {t['input_bg']};
-            }}
-            QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {t['text_muted']}; }}
-            QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
-                background: {t['input_disabled_bg']}; color: {t['input_disabled_text']};
-            }}
-            QComboBox::drop-down {{
-                subcontrol-origin: padding; subcontrol-position: top right; width: 26px;
-                border-left: 1px solid {t['border']}; border-top-right-radius: 7px;
-                border-bottom-right-radius: 7px; background: transparent;
-            }}
-            QComboBox::down-arrow {{ width: 10px; height: 10px; }}
-
-            /* ── CRITICAL: ComboBox popup dropdown ── */
-            QComboBox QAbstractItemView {{
-                background: {t['surface']}; color: {t['text_primary']};
-                border: 1.5px solid {t['border']}; border-radius: 7px;
-                padding: 4px; outline: none;
-                selection-background-color: {t['accent_light']};
-                selection-color: {t['accent_light_text']};
-            }}
-            QComboBox QAbstractItemView::item {{
-                padding: 8px 12px; min-height: 28px; color: {t['text_primary']};
-                border-radius: 4px;
-            }}
-            QComboBox QAbstractItemView::item:hover {{
-                background: {t['surface2']}; color: {t['text_primary']};
-            }}
-            QComboBox QAbstractItemView::item:selected {{
-                background: {t['accent_light']}; color: {t['accent_light_text']};
-            }}
-
-            QSpinBox::up-button, QSpinBox::down-button {{
-                subcontrol-origin: border; border-left: 1px solid {t['border']};
-                width: 22px; background: {t['input_bg']};
-            }}
-            QSpinBox::up-button {{
-                subcontrol-position: top right; border-bottom: 1px solid {t['border']};
-                border-top-right-radius: 7px;
-            }}
-            QSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: 7px; }}
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {t['surface2']}; }}
-
-            QPushButton {{
-                padding: 8px 20px; background: {t['btn_bg']}; border: 1.5px solid {t['btn_border']};
-                border-radius: 7px; color: {t['btn_text']}; font-weight: 500;
-                font-size: 13px; min-height: 22px;
-            }}
-            QPushButton:hover {{ background: {t['btn_hover']}; border-color: {t['btn_hover_border']}; color: {t['text_primary']}; }}
-            QPushButton:pressed {{ background: {t['btn_pressed']}; }}
-            QPushButton:disabled {{ background: {t['surface2']}; color: {t['text_muted']}; border-color: {t['border']}; }}
-
-            QPushButton#save_btn {{
-                background: {t['accent']}; color: {t['accent_text']}; font-weight: 700;
-                font-size: 14px; padding: 10px 32px; border-radius: 8px; border: none;
-            }}
-            QPushButton#save_btn:hover {{ background: {t['accent_hover']}; }}
-            QPushButton#save_btn:pressed {{ background: {t['accent_pressed']}; }}
-            QPushButton#save_btn:disabled {{ background: {t['accent_disabled']}; }}
-
-            QPushButton#cancel_btn {{
-                background: {t['btn_bg']}; color: {t['btn_text']}; font-weight: 500;
-                font-size: 14px; padding: 10px 32px; border-radius: 8px;
-                border: 1.5px solid {t['btn_border']};
-            }}
-            QPushButton#cancel_btn:hover {{ background: {t['btn_hover']}; border-color: {t['btn_hover_border']}; }}
-
-            QPushButton#theme_btn {{
-                background: transparent; border: 1.5px solid {t['border']};
-                border-radius: 7px; color: {t['text_secondary']};
-                font-size: 14px; padding: 4px 12px; min-width: 80px;
-            }}
-            QPushButton#theme_btn:hover {{ background: {t['surface2']}; border-color: {t['border_focus']}; color: {t['accent']}; }}
-
-            QPushButton#test_btn {{
-                background: {t['accent']}; color: {t['accent_text']}; font-weight: 600;
-                padding: 10px 24px; border-radius: 7px; border: none; font-size: 13px;
-            }}
-            QPushButton#test_btn:hover {{ background: {t['accent_hover']}; }}
-            QPushButton#test_btn:pressed {{ background: {t['accent_pressed']}; }}
-            QPushButton#test_btn:disabled {{ background: {t['accent_disabled']}; }}
-
-            QPushButton#printer_config_save {{
-                background: {t['teal']}; color: white; font-weight: 600;
-                padding: 10px 24px; border-radius: 7px; border: none; font-size: 13px;
-            }}
-            QPushButton#printer_config_save:hover {{ background: {t['teal_hover']}; }}
-            QPushButton#printer_config_save:disabled {{ background: {t['teal_disabled']}; color: rgba(255,255,255,0.5); }}
-
-            QPushButton#printer_config_reset {{
-                background: {t['btn_bg']}; color: {t['btn_text']}; font-weight: 500;
-                padding: 10px 20px; border-radius: 7px; border: 1.5px solid {t['btn_border']}; font-size: 13px;
-            }}
-            QPushButton#printer_config_reset:hover {{ background: {t['btn_hover']}; border-color: {t['btn_hover_border']}; }}
-
-            QListWidget {{
-                border: 1.5px solid {t['border']}; border-radius: 8px;
-                background: {t['list_bg']}; color: {t['text_primary']};
-                outline: none; padding: 4px; font-size: 13px;
-                alternate-background-color: {t['list_alt']};
-            }}
-            QListWidget::item {{ padding: 10px 14px; border-radius: 5px; margin-bottom: 2px; color: {t['text_primary']}; }}
-            QListWidget::item:hover {{ background: {t['list_hover']}; color: {t['text_primary']}; }}
-            QListWidget::item:selected {{ background: {t['list_sel_bg']}; color: {t['list_sel_text']}; font-weight: 600; }}
-
-            QTableWidget {{
-                border: 1.5px solid {t['border']}; border-radius: 8px;
-                background: {t['surface']}; gridline-color: {t['table_grid']};
-                color: {t['text_primary']}; font-size: 13px;
-                alternate-background-color: {t['surface2']};
-                selection-background-color: {t['table_sel_bg']};
-                selection-color: {t['table_sel_text']};
-            }}
-            QHeaderView::section {{
-                background-color: {t['table_header']}; padding: 10px 12px;
-                border: none; border-bottom: 2px solid {t['border']};
-                border-right: 1px solid {t['table_grid']};
-                font-weight: 700; color: {t['table_header_text']}; font-size: 11px;
-            }}
-
-            QSplitter::handle {{ background: {t['splitter']}; width: 1px; }}
-            QSplitter::handle:horizontal {{ width: 5px; margin: 2px 0; }}
-            QSplitter::handle:horizontal:hover {{ background: {t['accent']}; }}
-
-            QCheckBox {{
-                background: transparent; spacing: 10px;
-                font-size: 13px; color: {t['text_secondary']};
-            }}
-            QCheckBox::indicator {{
-                width: 20px; height: 20px; border: 2px solid {t['checkbox_border']};
-                border-radius: 5px; background: {t['checkbox_bg']};
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {t['accent']}; border-color: {t['accent']};
-            }}
-            QCheckBox::indicator:hover {{ border-color: {t['text_muted']}; }}
-            QCheckBox::indicator:checked:hover {{ background-color: {t['accent_hover']}; border-color: {t['accent_hover']}; }}
-
-            QScrollArea, QScrollArea QWidget {{ background: transparent; border: none; }}
-
-            QScrollBar:vertical {{
-                border: none; background: {t['surface2']}; width: 8px;
-                margin: 0; border-radius: 4px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {t['scrollbar']}; min-height: 24px; border-radius: 4px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: {t['scrollbar_hover']}; }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-
-            QFrame#footer_frame {{
-                background: {t['footer_bg']}; border: 1px solid {t['border']}; border-radius: 8px;
-            }}
-            QLabel#lbl_version {{
-                font-weight: 600; color: {t['text_muted']}; font-size: 12px;
-                background: transparent; padding: 2px 8px;
-                border: 1px solid {t['border']}; border-radius: 4px;
-            }}
-            QLabel#lbl_footer_status, QLabel#lbl_last_sync {{
-                font-size: 12px; background: transparent;
-            }}
-        """
+log = get_logger()
 
 
 # ─────────────────────────────────────────────
@@ -333,8 +75,13 @@ class SettingsWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("TrayPrint Settings")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(900, 650)
         self.resize(900, 650)
+        
+        # Callback for applying settings without restart (set by app.py)
+        self.apply_callback = None
+        # Optional update checker reference (set by app.py)
+        self.update_checker = None
         
         self.config_path = os.path.join(get_root_dir(), 'config.json')
         self.config_data = {
@@ -345,12 +92,12 @@ class SettingsWindow(QDialog):
             "hub_url": "",
             "agent_key": "",
             "printer_configs": {},
-            "theme": "light",
+            "theme": "dark",
         }
         self.load_config()
         
-        self._theme_id = self.config_data.get('theme', 'light')
-        self._theme = ThemeManager.get(self._theme_id)
+        self._theme_id = self.config_data.get('theme', 'dark')
+        self._theme = get_palette(self._theme_id)
         
         self._last_sync_time = None
         
@@ -392,6 +139,7 @@ class SettingsWindow(QDialog):
         self.setup_connection_tab()
         self.setup_general_tab()
         self.setup_printers_tab()
+        self.setup_updates_tab()
         self.setup_jobs_tab()
         
         # Bottom button row
@@ -432,7 +180,7 @@ class SettingsWindow(QDialog):
 
         self.btn_theme = QPushButton()
         self.btn_theme.setObjectName("theme_btn")
-        self.btn_theme.setToolTip("Toggle Dark / Light theme")
+        self.btn_theme.setToolTip("Toggle between Dark and Light theme")
         self.btn_theme.clicked.connect(self.toggle_theme)
 
         footer_layout.addWidget(self.lbl_version)
@@ -453,14 +201,16 @@ class SettingsWindow(QDialog):
         group.setStyleSheet(f"""
             QGroupBox {{
                 font-weight: 700; font-size: 14px; color: {t['group_title']};
-                border: 1px solid {t['group_border']}; border-radius: 10px;
-                margin-top: 16px; padding: 20px 12px 12px 12px;
+                border: 1px solid {t['group_border']}; border-radius: 8px;
+                margin-top: 16px; padding: 18px 12px 12px 12px;
                 background: {t['group_bg']};
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin; subcontrol-position: top left;
                 padding: 4px 12px; background: {t['group_bg']};
                 color: {t['group_title']};
+                border: 1px solid {t['group_border']};
+                border-radius: 4px;
             }}
         """)
         return group
@@ -468,8 +218,12 @@ class SettingsWindow(QDialog):
     def _style_field_label(self, text):
         """Create a styled form label."""
         label = QLabel(text)
-        label.setStyleSheet("font-weight: 600; font-size: 13px; color: #374151;")
+        label.setStyleSheet(
+            "font-weight: 600; font-size: 13px; color: %s;" % self._theme['text_secondary']
+        )
         return label
+
+    # ── Connection Tab ──
 
     def setup_connection_tab(self):
         tab = QWidget()
@@ -505,9 +259,13 @@ class SettingsWindow(QDialog):
         # Hub URL display
         url_layout = QHBoxLayout()
         url_label = QLabel("Target:")
-        url_label.setStyleSheet("font-weight: 600; font-size: 12px; color: #374151;")
+        url_label.setStyleSheet(
+            "font-weight: 600; font-size: 12px; color: %s;" % self._theme['text_secondary']
+        )
         self.lbl_hub_url_display = QLabel("Not configured")
-        self.lbl_hub_url_display.setStyleSheet("font-size: 12px; color: #6b7280;")
+        self.lbl_hub_url_display.setStyleSheet(
+            "font-size: 12px; color: %s;" % self._theme['text_muted']
+        )
         url_layout.addWidget(url_label)
         url_layout.addWidget(self.lbl_hub_url_display)
         url_layout.addStretch()
@@ -516,16 +274,20 @@ class SettingsWindow(QDialog):
         # Status indicator row
         indicator_layout = QHBoxLayout()
         self.lbl_status_dot = QLabel("●")
-        self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #6b7280;")
+        self.lbl_status_dot.setStyleSheet("font-size: 26px; color: %s;" % self._theme['text_muted'])
         self.lbl_status_text = QLabel("Checking...")
-        self.lbl_status_text.setStyleSheet("font-size: 14px; color: #374151; font-weight: 500;")
+        self.lbl_status_text.setStyleSheet(
+            "font-size: 14px; color: %s; font-weight: 500;" % self._theme['text_secondary']
+        )
         indicator_layout.addWidget(self.lbl_status_dot)
         indicator_layout.addSpacing(6)
         indicator_layout.addWidget(self.lbl_status_text)
         indicator_layout.addStretch()
 
         self.lbl_conn_status = QLabel("")
-        self.lbl_conn_status.setStyleSheet("color: #6b7280; font-size: 12px;")
+        self.lbl_conn_status.setStyleSheet(
+            "color: %s; font-size: 12px;" % self._theme['text_muted']
+        )
 
         status_layout.addLayout(indicator_layout)
         status_layout.addWidget(self.lbl_conn_status)
@@ -543,11 +305,32 @@ class SettingsWindow(QDialog):
         layout.addStretch()
         self.tabs.addTab(tab, "Connection")
 
+    # ── General Tab ──
+
     def setup_general_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(8)
         layout.setContentsMargins(4, 4, 4, 4)
+
+        # ── Theme Selection ──
+        theme_group = self._style_section_group("Appearance")
+        theme_layout = QFormLayout(theme_group)
+        theme_layout.setSpacing(10)
+        theme_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.cmb_theme = QComboBox()
+        self.cmb_theme.addItem("☀️  Light", "light")
+        self.cmb_theme.addItem("🌙  Dark", "dark")
+        idx = self.cmb_theme.findData(self._theme_id)
+        if idx >= 0:
+            self.cmb_theme.setCurrentIndex(idx)
+        self.cmb_theme.currentIndexChanged.connect(self._on_theme_combo_changed)
+        self.cmb_theme.setMinimumWidth(200)
+        self.cmb_theme.setToolTip("Select UI color scheme (changes apply immediately)")
+
+        theme_layout.addRow(self._style_field_label("Theme:"), self.cmb_theme)
+        layout.addWidget(theme_group)
 
         # ── Application Behavior ──
         behavior_group = self._style_section_group("Application Behavior")
@@ -558,6 +341,13 @@ class SettingsWindow(QDialog):
         self.chk_autostart.setChecked(autostart.is_autostart_enabled())
         self.chk_autostart.toggled.connect(self.on_autostart_toggled)
         behavior_layout.addWidget(self.chk_autostart)
+
+        # "Start TrayPrint when Windows starts" checkbox (persisted in config.json)
+        self.chk_windows_startup = QCheckBox("Start TrayPrint when Windows starts")
+        startup_enabled = self.config_data.get('windows_startup', False)
+        self.chk_windows_startup.setChecked(startup_enabled)
+        self.chk_windows_startup.toggled.connect(self._on_windows_startup_toggled)
+        behavior_layout.addWidget(self.chk_windows_startup)
 
         layout.addWidget(behavior_group)
 
@@ -594,6 +384,189 @@ class SettingsWindow(QDialog):
         layout.addStretch()
         self.tabs.addTab(tab, "General")
 
+    # ── Updates Tab ──
+
+    def setup_updates_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # ── Software Updates ──
+        updates_group = self._style_section_group("Software Updates")
+        updates_layout = QVBoxLayout(updates_group)
+        updates_layout.setSpacing(10)
+
+        # Current version
+        version_row = QHBoxLayout()
+        version_row.addWidget(QLabel("Current Version:"))
+        self.lbl_current_version = QLabel(f"v{server.APP_VERSION}")
+        self.lbl_current_version.setStyleSheet(
+            "font-weight: 700; font-size: 14px; color: %s;" % self._theme['accent']
+        )
+        version_row.addWidget(self.lbl_current_version)
+        version_row.addStretch()
+        updates_layout.addLayout(version_row)
+
+        # Separator
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setStyleSheet("color: %s;" % self._theme['border'])
+        updates_layout.addWidget(line)
+
+        # Update status / info area
+        self.lbl_update_status = QLabel("Update checker not initialized.")
+        self.lbl_update_status.setWordWrap(True)
+        self.lbl_update_status.setStyleSheet(
+            "font-size: 13px; padding: 8px 0; color: %s;" % self._theme['text_secondary']
+        )
+        updates_layout.addWidget(self.lbl_update_status)
+
+        # Release notes
+        self.lbl_release_notes = QLabel("")
+        self.lbl_release_notes.setWordWrap(True)
+        self.lbl_release_notes.setStyleSheet(
+            "font-size: 12px; color: %s; padding: 4px 12px; "
+            "background: %s; border-radius: 6px; border: 1px solid %s;"
+            % (self._theme['text_muted'], self._theme['bg_card'], self._theme['border'])
+        )
+        self.lbl_release_notes.setVisible(False)
+        updates_layout.addWidget(self.lbl_release_notes)
+
+        # Progress bar
+        self.progress_update = QProgressBar()
+        self.progress_update.setVisible(False)
+        self.progress_update.setMinimum(0)
+        self.progress_update.setMaximum(100)
+        self.progress_update.setValue(0)
+        updates_layout.addWidget(self.progress_update)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        self.btn_check_updates = QPushButton("Check for Updates")
+        self.btn_check_updates.setObjectName("test_btn")
+        self.btn_check_updates.clicked.connect(self.on_check_updates)
+        btn_row.addWidget(self.btn_check_updates)
+
+        self.btn_download_update = QPushButton("Download & Install")
+        self.btn_download_update.setObjectName("save_btn")
+        self.btn_download_update.setVisible(False)
+        self.btn_download_update.clicked.connect(self.on_download_update)
+        btn_row.addWidget(self.btn_download_update)
+
+        btn_row.addStretch()
+        updates_layout.addLayout(btn_row)
+
+        updates_layout.addStretch()
+        layout.addWidget(updates_group)
+        layout.addStretch()
+        self.tabs.addTab(tab, "Updates")
+
+    def _refresh_updates_tab(self):
+        """Refresh the updates tab UI based on update checker state."""
+        if not self.update_checker:
+            self.lbl_update_status.setText(
+                "Update checker not configured.\nConfigure Hub URL and Agent Key in the Connection tab."
+            )
+            self.btn_check_updates.setEnabled(False)
+            self.btn_download_update.setVisible(False)
+            return
+
+        self.btn_check_updates.setEnabled(True)
+        checker = self.update_checker
+
+        if checker.update_ready:
+            self.lbl_update_status.setText(
+                f"\u2b06 Update v{checker.latest_version} is available!"
+            )
+            self.lbl_update_status.setStyleSheet(
+                "font-size: 13px; padding: 8px 0; color: %s; font-weight: 600;" % self._theme['success']
+            )
+            if checker.release_notes:
+                self.lbl_release_notes.setText(f"Release notes:\n{checker.release_notes}")
+                self.lbl_release_notes.setVisible(True)
+            else:
+                self.lbl_release_notes.setVisible(False)
+            self.btn_download_update.setVisible(True)
+        else:
+            self.lbl_update_status.setText("You are running the latest version.")
+            self.lbl_update_status.setStyleSheet(
+                "font-size: 13px; padding: 8px 0; color: %s;" % self._theme['text_muted']
+            )
+            self.lbl_release_notes.setVisible(False)
+            self.btn_download_update.setVisible(False)
+
+    # ── Update check / download handlers ──
+
+    def on_check_updates(self):
+        """Trigger an immediate update check."""
+        if not self.update_checker:
+            return
+
+        self.btn_check_updates.setEnabled(False)
+        self.btn_check_updates.setText("Checking...")
+        self.lbl_update_status.setText("Checking for updates...")
+        QApplication.processEvents()
+
+        def _do_check():
+            try:
+                self.update_checker.check_for_updates()
+                # Schedule UI update on the main thread
+                QTimer.singleShot(0, self._refresh_updates_tab)
+                QTimer.singleShot(0, lambda: self.btn_check_updates.setText("Check for Updates"))
+                QTimer.singleShot(0, lambda: self.btn_check_updates.setEnabled(True))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self.lbl_update_status.setText(f"Check failed: {e}"))
+                QTimer.singleShot(0, lambda: self.btn_check_updates.setText("Check for Updates"))
+                QTimer.singleShot(0, lambda: self.btn_check_updates.setEnabled(True))
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    def on_download_update(self):
+        """Download and install the update."""
+        if not self.update_checker or not self.update_checker.update_ready:
+            return
+
+        self.btn_download_update.setEnabled(False)
+        self.btn_download_update.setText("Downloading...")
+        self.progress_update.setVisible(True)
+        self.progress_update.setValue(0)
+        QApplication.processEvents()
+
+        def _progress(pct):
+            QTimer.singleShot(0, lambda: self.progress_update.setValue(int(pct * 100)))
+
+        def _do_download():
+            try:
+                path = self.update_checker.download_update(progress_callback=_progress)
+                if path:
+                    QTimer.singleShot(0, lambda: self.lbl_update_status.setText(
+                        "Download complete! Installing..."))
+                    QTimer.singleShot(0, lambda: self.progress_update.setValue(100))
+                    # Install
+                    success = self.update_checker.install_update(path)
+                    if success:
+                        QTimer.singleShot(0, lambda: self.lbl_update_status.setText(
+                            "Update installed successfully. The application will restart."))
+                    else:
+                        QTimer.singleShot(0, lambda: self.lbl_update_status.setText(
+                            "Installation failed. See log for details."))
+                else:
+                    QTimer.singleShot(0, lambda: self.lbl_update_status.setText(
+                        "Download failed. See log for details."))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self.lbl_update_status.setText(
+                    f"Update failed: {e}"))
+            finally:
+                QTimer.singleShot(0, lambda: self.btn_download_update.setEnabled(True))
+                QTimer.singleShot(0, lambda: self.btn_download_update.setText("Download & Install"))
+                QTimer.singleShot(0, lambda: self.progress_update.setVisible(False))
+
+        threading.Thread(target=_do_download, daemon=True).start()
+
     # ─────────────────────────────────────────────
     #  Printer Config Tab (split-panel layout)
     # ─────────────────────────────────────────────
@@ -605,7 +578,9 @@ class SettingsWindow(QDialog):
         layout.setContentsMargins(4, 4, 4, 4)
 
         self.lbl_printer_count = QLabel("Found 0 printers on this system.")
-        self.lbl_printer_count.setStyleSheet("font-weight: 600; font-size: 13px; color: #374151; margin-bottom: 4px;")
+        self.lbl_printer_count.setStyleSheet(
+            "font-weight: 600; font-size: 13px; color: %s; margin-bottom: 4px;" % self._theme['text_secondary']
+        )
         layout.addWidget(self.lbl_printer_count)
 
         # Splitter: left = printer list, right = config panel
@@ -617,7 +592,9 @@ class SettingsWindow(QDialog):
         left_layout.setContentsMargins(6, 6, 4, 6)
 
         lbl_printers_title = QLabel("Available Printers")
-        lbl_printers_title.setStyleSheet("font-weight: 700; color: #111827; padding: 6px 0; font-size: 13px;")
+        lbl_printers_title.setStyleSheet(
+            "font-weight: 700; color: %s; padding: 6px 0; font-size: 13px;" % self._theme['text_primary']
+        )
         left_layout.addWidget(lbl_printers_title)
 
         self.list_printers = QListWidget()
@@ -634,7 +611,9 @@ class SettingsWindow(QDialog):
         right_layout.setSpacing(8)
 
         self.lbl_selected_printer = QLabel("No printer selected")
-        self.lbl_selected_printer.setStyleSheet("font-weight: 700; color: #111827; font-size: 15px; padding: 6px 0;")
+        self.lbl_selected_printer.setStyleSheet(
+            "font-weight: 700; color: %s; font-size: 15px; padding: 6px 0;" % self._theme['text_primary']
+        )
         right_layout.addWidget(self.lbl_selected_printer)
 
         # Build control widgets based on PRINTER_CONTROL_FIELDS definition
@@ -707,6 +686,12 @@ class SettingsWindow(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
+        self.btn_refresh_caps = QPushButton("Refresh Capabilities")
+        self.btn_refresh_caps.setObjectName("printer_config_refresh_caps")
+        self.btn_refresh_caps.clicked.connect(self.on_refresh_capabilities)
+        self.btn_refresh_caps.setEnabled(False)
+        self.btn_refresh_caps.setToolTip("Query printer for supported trays, resolutions, and media sizes")
+
         self.btn_reset_printer_config = QPushButton("Reset to Defaults")
         self.btn_reset_printer_config.setObjectName("printer_config_reset")
         self.btn_reset_printer_config.clicked.connect(self.on_reset_printer_config)
@@ -717,6 +702,7 @@ class SettingsWindow(QDialog):
         self.btn_save_printer_config.clicked.connect(self.on_save_printer_config)
         self.btn_save_printer_config.setEnabled(False)
 
+        btn_row.addWidget(self.btn_refresh_caps)
         btn_row.addWidget(self.btn_reset_printer_config)
         btn_row.addStretch()
         btn_row.addWidget(self.btn_save_printer_config)
@@ -798,6 +784,7 @@ class SettingsWindow(QDialog):
             self.lbl_selected_printer.setText("No printer selected")
             self.btn_save_printer_config.setEnabled(False)
             self.btn_reset_printer_config.setEnabled(False)
+            self.btn_refresh_caps.setEnabled(False)
             return
 
         item = self.list_printers.item(row)
@@ -808,7 +795,107 @@ class SettingsWindow(QDialog):
         self.lbl_selected_printer.setText(printer_name)
         self.btn_save_printer_config.setEnabled(True)
         self.btn_reset_printer_config.setEnabled(True)
+        self.btn_refresh_caps.setEnabled(True)
         self.populate_printer_config_ui(printer_name)
+
+    def on_refresh_capabilities(self):
+        """Fetch capabilities for the selected printer and update dropdowns."""
+        printer_name = self.lbl_selected_printer.text()
+        if not printer_name or printer_name == "No printer selected":
+            return
+
+        self.btn_refresh_caps.setEnabled(False)
+        self.btn_refresh_caps.setText("Refreshing...")
+
+        def _do_refresh():
+            """Run capability discovery in a background thread."""
+            try:
+                import capabilities as caps_mod
+                caps = caps_mod.discover_capabilities(printer_name)
+                # Schedule UI update back on main thread
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, lambda: self._apply_capabilities_to_dropdowns(printer_name, caps))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self.btn_refresh_caps.setText("Refresh Capabilities"))
+                QTimer.singleShot(0, lambda: self.btn_refresh_caps.setEnabled(True))
+                log.error("Capability refresh failed for '%s': %s", printer_name, e)
+                QTimer.singleShot(0, lambda: QMessageBox.warning(
+                    self, "Capability Error",
+                    f"Failed to query capabilities for '{printer_name}':\n{e}"
+                ))
+
+        import threading
+        threading.Thread(target=_do_refresh, daemon=True).start()
+
+    def _apply_capabilities_to_dropdowns(self, printer_name, capabilities):
+        """Update PRINTER_CONTROL_FIELDS dropdown options from discovered capabilities."""
+        if 'error' in capabilities and capabilities['error']:
+            self.btn_refresh_caps.setText("Refresh Capabilities")
+            self.btn_refresh_caps.setEnabled(True)
+            QMessageBox.warning(self, "Capability Error", capabilities['error'])
+            return
+
+        updated_fields = 0
+
+        # ── Trays ──
+        trays = capabilities.get('trays', [])
+        if trays and 'tray_source' in self.printer_control_widgets:
+            w = self.printer_control_widgets['tray_source']
+            current_val = w.currentText()
+            w.clear()
+            w.addItems(trays)
+            idx = w.findText(current_val)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+            updated_fields += 1
+
+        # ── Media Sizes (add to the existing fixed list or replace) ──
+        # We keep the original PRINTER_CONTROL_FIELDS as base and append discovered sizes
+        # For media_size we don't have a dedicated widget, but we log them
+        media_sizes = capabilities.get('media_sizes', [])
+        if media_sizes:
+            log.info("Discovered %d media sizes for '%s'", len(media_sizes), printer_name)
+
+        # ── Resolutions ──
+        resolutions = capabilities.get('resolutions', [])
+        if resolutions and 'print_quality' in self.printer_control_widgets:
+            # Store resolutions in a hidden attribute for potential future use
+            self._cached_resolutions = resolutions
+            updated_fields += 1
+
+        # ── Color Modes ──
+        color_modes = capabilities.get('color_modes', [])
+        if color_modes and 'color_mode' in self.printer_control_widgets:
+            w = self.printer_control_widgets['color_mode']
+            current_val = w.currentText()
+            w.clear()
+            w.addItems(color_modes)
+            idx = w.findText(current_val)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+            updated_fields += 1
+
+        # ── Duplex ──
+        duplex = capabilities.get('duplex', [])
+        if duplex:
+            log.info("Discovered %d duplex modes for '%s'", len(duplex), printer_name)
+            # Store for potential future use
+            self._cached_duplex = duplex
+
+        self.btn_refresh_caps.setText("Refresh Capabilities")
+        self.btn_refresh_caps.setEnabled(True)
+
+        if updated_fields > 0:
+            log.info("Updated capability dropdowns for '%s' (%d fields)", printer_name, updated_fields)
+            QMessageBox.information(
+                self, "Capabilities Updated",
+                f"Refreshed {updated_fields} capability fields for '{printer_name}'."
+            )
+        else:
+            QMessageBox.information(
+                self, "Capabilities",
+                f"No capability fields to update for '{printer_name}'."
+            )
 
     def on_save_printer_config(self):
         """Save the current control values for the selected printer."""
@@ -865,7 +952,9 @@ class SettingsWindow(QDialog):
 
         # Header
         jobs_header = QLabel("Recent Print Jobs")
-        jobs_header.setStyleSheet("font-weight: 700; font-size: 14px; color: #111827; padding: 4px 0;")
+        jobs_header.setStyleSheet(
+            "font-weight: 700; font-size: 14px; color: %s; padding: 4px 0;" % self._theme['text_primary']
+        )
         layout.addWidget(jobs_header)
 
         self.table_jobs = QTableWidget(0, 5)
@@ -899,35 +988,35 @@ class SettingsWindow(QDialog):
         # ── Connection tab indicator ──
         if "Connected" in hub_status:
             # Green dot + text
-            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #22c55e;")
+            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #4caf88;")
             self.lbl_status_text.setText("Connected")
-            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #16a34a; font-weight: 600;")
+            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #4caf88; font-weight: 600;")
             self.lbl_conn_status.setText(hub_status)
-            self.lbl_conn_status.setStyleSheet("color: #22c55e; font-weight: 500; font-size: 12px;")
+            self.lbl_conn_status.setStyleSheet("color: #4caf88; font-weight: 500; font-size: 12px;")
             # Footer
             self.lbl_footer_status.setText("● Connected")
-            self.lbl_footer_status.setStyleSheet("color: #22c55e; font-weight: 600; font-size: 12px;")
+            self.lbl_footer_status.setStyleSheet("color: #4caf88; font-weight: 600; font-size: 12px;")
             self._last_sync_time = None  # will be updated by next sync
         elif "Offline" in hub_status or "Disconnected" in hub_status:
             # Red dot + text
-            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #ef4444;")
+            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #e66565;")
             self.lbl_status_text.setText("Disconnected")
-            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #dc2626; font-weight: 600;")
+            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #e66565; font-weight: 600;")
             self.lbl_conn_status.setText(hub_status)
-            self.lbl_conn_status.setStyleSheet("color: #ef4444; font-weight: 500; font-size: 12px;")
+            self.lbl_conn_status.setStyleSheet("color: #e66565; font-weight: 500; font-size: 12px;")
             # Footer
             self.lbl_footer_status.setText("● Disconnected")
-            self.lbl_footer_status.setStyleSheet("color: #ef4444; font-weight: 600; font-size: 12px;")
+            self.lbl_footer_status.setStyleSheet("color: #e66565; font-weight: 600; font-size: 12px;")
         else:
             # Amber dot + text
-            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #f59e0b;")
+            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #f0b34b;")
             self.lbl_status_text.setText("Checking...")
-            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #d97706; font-weight: 600;")
+            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #f0b34b; font-weight: 600;")
             self.lbl_conn_status.setText(hub_status)
-            self.lbl_conn_status.setStyleSheet("color: #f59e0b; font-weight: 500; font-size: 12px;")
+            self.lbl_conn_status.setStyleSheet("color: #f0b34b; font-weight: 500; font-size: 12px;")
             # Footer
             self.lbl_footer_status.setText("● Checking...")
-            self.lbl_footer_status.setStyleSheet("color: #f59e0b; font-weight: 600; font-size: 12px;")
+            self.lbl_footer_status.setStyleSheet("color: #f0b34b; font-weight: 600; font-size: 12px;")
 
     def refresh_status(self):
         # Hub Status
@@ -981,11 +1070,11 @@ class SettingsWindow(QDialog):
                 
                 status_item = QTableWidgetItem(j['status'])
                 if j['status'] == 'success':
-                    status_item.setForeground(QColor("#16a34a"))
+                    status_item.setForeground(QColor("#4caf88"))
                 elif j['status'] == 'failed':
-                    status_item.setForeground(QColor("#dc2626"))
+                    status_item.setForeground(QColor("#e66565"))
                 else:
-                    status_item.setForeground(QColor("#d97706"))
+                    status_item.setForeground(QColor("#f0b34b"))
                 self.table_jobs.setItem(row, 3, status_item)
                 
                 info = j['error'] if j['status'] == 'failed' else j.get('data_preview', '')
@@ -1008,6 +1097,19 @@ class SettingsWindow(QDialog):
         else:
             autostart.disable_autostart()
 
+    def _on_windows_startup_toggled(self, checked):
+        """Persist the 'Start TrayPrint when Windows starts' preference to config.json."""
+        self.config_data['windows_startup'] = checked
+        self.save_config()
+        if checked:
+            # Also enable the standard autostart mechanism
+            autostart.enable_autostart()
+            self.chk_autostart.setChecked(True)
+        else:
+            # Optionally disable standard autostart if user unchecks
+            autostart.disable_autostart()
+            self.chk_autostart.setChecked(False)
+
     def on_test_connection(self):
         hub_url = self.input_hub_url.text().strip()
         agent_key = self.input_agent_key.text().strip()
@@ -1021,11 +1123,11 @@ class SettingsWindow(QDialog):
         QApplication.processEvents()
         
         # Show testing state
-        self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #f59e0b;")
+        self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #f0b34b;")
         self.lbl_status_text.setText("Testing...")
-        self.lbl_status_text.setStyleSheet("font-size: 14px; color: #d97706; font-weight: 600;")
+        self.lbl_status_text.setStyleSheet("font-size: 14px; color: #f0b34b; font-weight: 600;")
         self.lbl_conn_status.setText("Connecting...")
-        self.lbl_conn_status.setStyleSheet("color: #f59e0b; font-weight: 500; font-size: 12px;")
+        self.lbl_conn_status.setStyleSheet("color: #f0b34b; font-weight: 500; font-size: 12px;")
         
         try:
             headers = {'Authorization': f'Bearer {agent_key}'}
@@ -1052,28 +1154,45 @@ class SettingsWindow(QDialog):
             elif resp.status_code == 401:
                 QMessageBox.warning(self, "Auth Failed", "Invalid Agent Key.\nPlease verify your key in the Print Hub dashboard.")
                 # Update status indicators for auth failure
-                self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #ef4444;")
+                self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #e66565;")
                 self.lbl_status_text.setText("Authentication Failed")
-                self.lbl_status_text.setStyleSheet("font-size: 14px; color: #dc2626; font-weight: 600;")
+                self.lbl_status_text.setStyleSheet("font-size: 14px; color: #e66565; font-weight: 600;")
                 self.lbl_conn_status.setText("Invalid Agent Key (HTTP 401)")
-                self.lbl_conn_status.setStyleSheet("color: #ef4444; font-weight: 500; font-size: 12px;")
+                self.lbl_conn_status.setStyleSheet("color: #e66565; font-weight: 500; font-size: 12px;")
             else:
                 QMessageBox.warning(self, "Connection Error", f"Hub returned an error (HTTP {resp.status_code})")
-                self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #ef4444;")
+                self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #e66565;")
                 self.lbl_status_text.setText("Error")
-                self.lbl_status_text.setStyleSheet("font-size: 14px; color: #dc2626; font-weight: 600;")
+                self.lbl_status_text.setStyleSheet("font-size: 14px; color: #e66565; font-weight: 600;")
                 self.lbl_conn_status.setText(f"HTTP Error {resp.status_code}")
-                self.lbl_conn_status.setStyleSheet("color: #ef4444; font-weight: 500; font-size: 12px;")
+                self.lbl_conn_status.setStyleSheet("color: #e66565; font-weight: 500; font-size: 12px;")
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Cannot reach the Print Hub server.\n\nError details: {e}")
-            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #ef4444;")
+            self.lbl_status_dot.setStyleSheet("font-size: 26px; color: #e66565;")
             self.lbl_status_text.setText("Connection Failed")
-            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #dc2626; font-weight: 600;")
+            self.lbl_status_text.setStyleSheet("font-size: 14px; color: #e66565; font-weight: 600;")
             self.lbl_conn_status.setText("Cannot reach server")
-            self.lbl_conn_status.setStyleSheet("color: #ef4444; font-weight: 500; font-size: 12px;")
+            self.lbl_conn_status.setStyleSheet("color: #e66565; font-weight: 500; font-size: 12px;")
         finally:
             self.btn_test_conn.setEnabled(True)
             self.btn_test_conn.setText("Test Connection")
+
+    def apply_settings(self):
+        """Apply settings changes live without restarting the app."""
+        # Notify the main app to reload config
+        if self.apply_callback:
+            try:
+                self.apply_callback()
+            except Exception as e:
+                log.error("Apply callback failed: %s", e)
+        
+        # Show brief status message
+        QMessageBox.information(
+            self, "Settings Applied",
+            "Settings saved and applied successfully.\n\n"
+            "Changes take effect immediately. No restart required."
+        )
+        self.accept()
 
     def on_save_clicked(self):
         self.config_data["hub_url"] = self.input_hub_url.text().strip()
@@ -1090,40 +1209,129 @@ class SettingsWindow(QDialog):
             self.set_printer_config(current_printer, config)
         
         if self.save_config():
-            reply = QMessageBox.question(
-                self, 'Restart Required',
-                "Settings saved successfully. TrayPrint needs to restart to apply changes.\n\nRestart now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-            )
-            
-            if reply == QMessageBox.Yes:
-                import sys
-                from PySide6.QtCore import QCoreApplication
-                QCoreApplication.quit()
-                os.execl(sys.executable, sys.executable, *sys.argv)
-            else:
-                self.accept()
+            self.apply_settings()
 
     def apply_styles(self):
         """Apply the current theme stylesheet to the window."""
-        self.setStyleSheet(ThemeManager.build_stylesheet(self._theme))
-        icon = self._theme.get('icon', '🌙')
-        name = ThemeManager.get('light' if self._theme_id == 'dark' else 'dark').get('name', '')
-        self.btn_theme.setText(f"{icon}  {name}")
+        stylesheet = get_stylesheet(self._theme_id)
+        # Add dialog-specific overrides
+        stylesheet += """
+            QPushButton#save_btn {
+                background: %s; color: %s; font-weight: 700;
+                font-size: 14px; padding: 10px 32px; border-radius: 8px; border: none;
+            }
+            QPushButton#save_btn:hover { background: %s; }
+            QPushButton#save_btn:pressed { background: %s; }
+            QPushButton#save_btn:disabled { background: %s; }
+
+            QPushButton#cancel_btn {
+                background: %s; color: %s; font-weight: 500;
+                font-size: 14px; padding: 10px 32px; border-radius: 8px;
+                border: 1.5px solid %s;
+            }
+            QPushButton#cancel_btn:hover { background: %s; border-color: %s; }
+
+            QPushButton#theme_btn {
+                background: transparent; border: 1.5px solid %s;
+                border-radius: 7px; color: %s;
+                font-size: 14px; padding: 4px 12px; min-width: 80px;
+            }
+            QPushButton#theme_btn:hover { background: %s; border-color: %s; color: %s; }
+
+            QPushButton#test_btn {
+                background: %s; color: %s; font-weight: 600;
+                padding: 10px 24px; border-radius: 7px; border: none; font-size: 13px;
+            }
+            QPushButton#test_btn:hover { background: %s; }
+            QPushButton#test_btn:pressed { background: %s; }
+            QPushButton#test_btn:disabled { background: %s; }
+
+            QPushButton#printer_config_save {
+                background: %s; color: white; font-weight: 600;
+                padding: 10px 24px; border-radius: 7px; border: none; font-size: 13px;
+            }
+            QPushButton#printer_config_save:hover { background: %s; }
+            QPushButton#printer_config_save:disabled { background: %s; color: rgba(255,255,255,0.5); }
+
+            QPushButton#printer_config_reset {
+                background: %s; color: %s; font-weight: 500;
+                padding: 10px 20px; border-radius: 7px; border: 1.5px solid %s; font-size: 13px;
+            }
+            QPushButton#printer_config_reset:hover { background: %s; border-color: %s; }
+
+            QLabel#lbl_version {
+                font-weight: 600; color: %s; font-size: 12px;
+                background: transparent; padding: 2px 8px;
+                border: 1px solid %s; border-radius: 4px;
+            }
+            QLabel#lbl_footer_status, QLabel#lbl_last_sync {
+                font-size: 12px; background: transparent;
+            }
+        """ % (
+            # save_btn
+            self._theme['accent'], self._theme['accent_text'],
+            self._theme['accent_hover'], self._theme['accent_pressed'],
+            self._theme['accent_disabled'],
+            # cancel_btn
+            self._theme['btn_bg'], self._theme['btn_text'],
+            self._theme['btn_border'],
+            self._theme['btn_hover'], self._theme['btn_hover_border'],
+            # theme_btn
+            self._theme['border'], self._theme['text_secondary'],
+            self._theme['surface2'], self._theme['border_focus'], self._theme['accent'],
+            # test_btn
+            self._theme['accent'], self._theme['accent_text'],
+            self._theme['accent_hover'], self._theme['accent_pressed'],
+            self._theme['accent_disabled'],
+            # printer_config_save (teal → success)
+            self._theme['success'],
+            self._theme['success_hover'],
+            self._theme['success_disabled'],
+            # printer_config_reset
+            self._theme['btn_bg'], self._theme['btn_text'],
+            self._theme['btn_border'],
+            self._theme['btn_hover'], self._theme['btn_hover_border'],
+            # lbl_version
+            self._theme['text_muted'], self._theme['border'],
+        )
+        self.setStyleSheet(stylesheet)
+        
+        # Update theme toggle button text
+        opposite_id = 'light' if self._theme_id == 'dark' else 'dark'
+        opposite = get_palette(opposite_id)
+        self.btn_theme.setText(f"{opposite['icon']}  {opposite['name']}")
+
+    def _on_theme_combo_changed(self, index):
+        """Handle theme combo box selection."""
+        new_theme = self.cmb_theme.itemData(index)
+        if new_theme and new_theme != self._theme_id:
+            self._theme_id = new_theme
+            self._theme = get_palette(self._theme_id)
+            self.config_data['theme'] = self._theme_id
+            self.save_config()
+            self.apply_styles()
+            # Re-apply group box per-widget styles (they use inline stylesheets)
+            self.refresh_status()
 
     def toggle_theme(self):
         """Toggle between light and dark theme without restarting."""
         self._theme_id = 'dark' if self._theme_id == 'light' else 'light'
-        self._theme = ThemeManager.get(self._theme_id)
+        self._theme = get_palette(self._theme_id)
         self.config_data['theme'] = self._theme_id
         self.save_config()
+        
+        # Sync combo box
+        idx = self.cmb_theme.findData(self._theme_id)
+        if idx >= 0:
+            self.cmb_theme.blockSignals(True)
+            self.cmb_theme.setCurrentIndex(idx)
+            self.cmb_theme.blockSignals(False)
+        
         self.apply_styles()
         # Re-apply group box per-widget styles (they use inline stylesheets)
         self.refresh_status()
 
 
-
 def show_settings():
     window = SettingsWindow()
     window.exec()
-

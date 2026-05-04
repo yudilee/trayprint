@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QPainter
 
+from theme import get_stylesheet, get_palette
+
 
 # ─────────────────────────────────────────────
 #  Data Model
@@ -84,10 +86,10 @@ _ICON_MAP = {
 }
 
 _COLOR_MAP = {
-    'info':    '#3b82f6',
-    'warning': '#f59e0b',
-    'error':   '#ef4444',
-    'success': '#22c55e',
+    'info':    '#5ba3d9',
+    'warning': '#f0b34b',
+    'error':   '#e66565',
+    'success': '#4caf88',
 }
 
 
@@ -98,32 +100,47 @@ class NotificationHistoryDialog(QDialog):
         super().__init__(parent)
         self._history = history
         self.setWindowTitle('Notification History')
-        self.resize(520, 400)
-        self.setMinimumSize(380, 280)
+        self.setMinimumSize(500, 400)
+        self.resize(520, 420)
+
+        self._theme_id = 'dark'
+        self._theme = get_palette(self._theme_id)
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         # Header
         header_layout = QHBoxLayout()
         header_label = QLabel(f'Notifications ({len(self._history)})')
-        header_label.setStyleSheet('font-weight: 600; font-size: 14px; color: #1e293b;')
+        header_label.setStyleSheet(
+            'font-weight: 700; font-size: 15px; color: %s; background: transparent;'
+            % self._theme['text_primary']
+        )
         header_layout.addWidget(header_label)
         header_layout.addStretch()
 
         self.btn_clear = QPushButton('Clear All')
-        self.btn_clear.setStyleSheet("""
-            QPushButton {
-                padding: 6px 14px;
-                background: #fef2f2;
-                border: 1px solid #fecaca;
-                border-radius: 6px;
-                color: #dc2626;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background: #fee2e2;
-            }
-        """)
+        self.btn_clear.setMinimumHeight(30)
+        self.btn_clear.setToolTip('Remove all notification history')
+        self.btn_clear.setStyleSheet(
+            "QPushButton {"
+            "  padding: 6px 14px;"
+            "  background: %s;"
+            "  border: 1px solid %s;"
+            "  border-radius: 6px;"
+            "  color: %s;"
+            "  font-weight: 500;"
+            "}"
+            "QPushButton:hover {"
+            "  background: %s;"
+            "}"
+        ) % (
+            self._theme['bg'],
+            self._theme['error'],
+            self._theme['error'],
+            '#3a2020',
+        )
         self.btn_clear.clicked.connect(self._on_clear)
         header_layout.addWidget(self.btn_clear)
 
@@ -132,26 +149,10 @@ class NotificationHistoryDialog(QDialog):
         # Notification list
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                background: #ffffff;
-                outline: none;
-            }
-            QListWidget::item {
-                padding: 10px 12px;
-                border-bottom: 1px solid #f1f5f9;
-            }
-            QListWidget::item:hover {
-                background: #f8fafc;
-            }
-            QListWidget::item:selected {
-                background: #eff6ff;
-                color: #1e293b;
-            }
-        """)
         layout.addWidget(self.list_widget)
+
+        # Apply shared theme stylesheet
+        self.setStyleSheet(get_stylesheet(self._theme_id))
 
         self._populate()
 
@@ -166,7 +167,7 @@ class NotificationHistoryDialog(QDialog):
             item.setToolTip(entry.message)
 
             # Color coding by type
-            color = _COLOR_MAP.get(entry.type, '#475569')
+            color = _COLOR_MAP.get(entry.type, self._theme['text_secondary'])
             item.setForeground(QColor(color))
             item.setData(Qt.UserRole, entry.entry_id)
             self.list_widget.addItem(item)

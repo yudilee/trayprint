@@ -15,13 +15,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 
+from theme import get_stylesheet, get_palette
+
 
 STATUS_STYLES = {
-    'pending':   ('\u23f3  Pending',   '#f59e0b'),   # ⏳
-    'printing':  ('\U0001f7e2  Printing', '#22c55e'), # 🟢
-    'success':   ('\u2705  Success',   '#22c55e'),   # ✅
-    'failed':    ('\u274c  Failed',    '#ef4444'),   # ❌
-    'cancelled': ('\u274c  Cancelled', '#6b7280'),   # ❌ grey
+    'pending':   ('\u23f3  Pending',   '#f0b34b'),   # ⏳ amber
+    'printing':  ('\U0001f7e2  Printing', '#4caf88'), # 🟢 green
+    'success':   ('\u2705  Success',   '#4caf88'),   # ✅ green
+    'failed':    ('\u274c  Failed',    '#e66565'),   # ❌ red
+    'cancelled': ('\u274c  Cancelled', '#707090'),   # ❌ grey
 }
 
 
@@ -31,38 +33,34 @@ class PrintQueueDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Print Queue')
-        self.resize(700, 420)
-        self.setMinimumSize(500, 300)
+        self.setMinimumSize(800, 500)
+        self.resize(800, 500)
+
+        self._theme_id = 'dark'
+        self._theme = get_palette(self._theme_id)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
         self._refresh_timer.start(3000)  # auto-refresh every 3 seconds
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
 
-        # ── Top bar: refresh button + empty state hint ──
+        # ── Top bar: title + refresh button ──
         top_layout = QHBoxLayout()
 
         title_label = QLabel('Print Job Queue')
-        title_label.setStyleSheet('font-weight: 600; font-size: 14px; color: #1e293b;')
+        title_label.setStyleSheet(
+            'font-weight: 700; font-size: 15px; color: %s; background: transparent;'
+            % self._theme['text_primary']
+        )
         top_layout.addWidget(title_label)
         top_layout.addStretch()
 
         self.btn_refresh = QPushButton('Refresh')
-        self.btn_refresh.setStyleSheet("""
-            QPushButton {
-                padding: 6px 14px;
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                color: #475569;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background: #f1f5f9;
-                border-color: #cbd5e1;
-            }
-        """)
+        self.btn_refresh.setMinimumHeight(30)
+        self.btn_refresh.setToolTip('Refresh the print queue (Ctrl+R)')
         self.btn_refresh.clicked.connect(self.refresh)
         top_layout.addWidget(self.btn_refresh)
 
@@ -81,47 +79,23 @@ class PrintQueueDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.setStyleSheet("""
-            QTableWidget {
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                background: #ffffff;
-                gridline-color: #f1f5f9;
-                color: #1e293b;
-                selection-background-color: #eff6ff;
-                selection-color: #1e293b;
-                alternate-background-color: #f8fafc;
-            }
-            QHeaderView::section {
-                background-color: #f8fafc;
-                padding: 10px 8px;
-                border: none;
-                border-bottom: 2px solid #e2e8f0;
-                border-right: 1px solid #f1f5f9;
-                font-weight: 600;
-                color: #475569;
-                font-size: 10px;
-                letter-spacing: 0.5px;
-                text-transform: uppercase;
-            }
-            QTableWidget::item {
-                padding: 6px 8px;
-                border-bottom: 1px solid #f8fafc;
-            }
-        """)
         layout.addWidget(self.table)
 
         # ── Empty state label (shown when no jobs) ──
         self.empty_label = QLabel('No active jobs')
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setStyleSheet(
-            'color: #94a3b8; font-size: 13px; padding: 30px;'
+            'color: %s; font-size: 14px; padding: 40px; background: transparent;'
+            % self._theme['text_muted']
         )
         self.empty_label.setVisible(False)
         layout.addWidget(self.empty_label)
 
         # ── Cancel confirmation dialog tracking ──
         self._cancel_in_progress = False
+
+        # Apply shared theme
+        self.setStyleSheet(get_stylesheet(self._theme_id))
 
         # Load initial data
         self.refresh()
@@ -175,13 +149,14 @@ class PrintQueueDialog(QDialog):
                 display_status = 'printing'
 
             status_info = STATUS_STYLES.get(display_status,
-                                            (display_status.capitalize(), '#64748b'))
+                                            (display_status.capitalize(), '#707090'))
             status_text, status_color = status_info
 
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(QColor(status_color))
             font = status_item.font()
             font.setBold(True)
+            font.setPointSize(11)
             status_item.setFont(font)
             self.table.setItem(row, 2, status_item)
 
@@ -206,25 +181,34 @@ class PrintQueueDialog(QDialog):
 
             if can_cancel:
                 btn_cancel = QPushButton('Cancel')
-                btn_cancel.setStyleSheet("""
-                    QPushButton {
-                        padding: 4px 10px;
-                        background: #fef2f2;
-                        border: 1px solid #fecaca;
-                        border-radius: 4px;
-                        color: #dc2626;
-                        font-size: 11px;
-                        font-weight: 500;
-                    }
-                    QPushButton:hover {
-                        background: #fee2e2;
-                    }
-                    QPushButton:disabled {
-                        background: #f1f5f9;
-                        color: #94a3b8;
-                        border-color: #e2e8f0;
-                    }
-                """)
+                btn_cancel.setMinimumHeight(26)
+                btn_cancel.setStyleSheet(
+                    "QPushButton {"
+                    "  padding: 4px 10px;"
+                    "  background: %s;"
+                    "  border: 1px solid %s;"
+                    "  border-radius: 4px;"
+                    "  color: %s;"
+                    "  font-size: 11px;"
+                    "  font-weight: 500;"
+                    "}"
+                    "QPushButton:hover {"
+                    "  background: %s;"
+                    "}"
+                    "QPushButton:disabled {"
+                    "  background: %s;"
+                    "  color: %s;"
+                    "  border-color: %s;"
+                    "}"
+                ) % (
+                    self._theme['bg'],       # bg for cancel (error-toned)
+                    self._theme['error'],     # border
+                    self._theme['error'],     # text
+                    '#3a2020',                # hover (slightly lighter red)
+                    self._theme['bg'],        # disabled bg
+                    self._theme['text_muted'],# disabled text
+                    self._theme['border'],    # disabled border
+                )
                 btn_cancel.setCursor(Qt.PointingHandCursor)
                 job_id = j.get('id', '')
                 btn_cancel.clicked.connect(
@@ -234,7 +218,7 @@ class PrintQueueDialog(QDialog):
             else:
                 # Show a disabled placeholder
                 placeholder = QLabel('\u2014')
-                placeholder.setStyleSheet('color: #cbd5e1;')
+                placeholder.setStyleSheet('color: %s; background: transparent;' % self._theme['text_muted'])
                 placeholder.setAlignment(Qt.AlignCenter)
                 actions_layout.addWidget(placeholder)
 
@@ -267,6 +251,13 @@ class PrintQueueDialog(QDialog):
                     )
         finally:
             self._cancel_in_progress = False
+
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts."""
+        if event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
+            self.refresh()
+        else:
+            super().keyPressEvent(event)
 
     def closeEvent(self, event):
         """Stop the refresh timer when dialog closes."""

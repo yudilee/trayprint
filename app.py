@@ -11,12 +11,15 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
 from PySide6.QtCore import Qt, QTimer, QCoreApplication
 
 import server
+import websocket_client
 import autostart
 import ui_settings
 from path_utils import get_root_dir
 from logger import get_logger, get_log_path
 from notification_history import NotificationHistory, NotificationHistoryDialog
 from queue_dialog import PrintQueueDialog
+from diagnostics_dialog import DiagnosticsDialog
+from updater import UpdateChecker
 
 log = get_logger()
 
@@ -107,13 +110,19 @@ class TrayApp:
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
 
+        # macOS-specific: high-DPI pixmap support
+        if sys.platform == 'darwin':
+            self.app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+            log.info("macOS: enabled High-DPI pixmap support")
+
         # Printing state tracking
         self._is_printing = False
         self._normal_icon = create_tray_icon(printing=False)
         self._printing_icon = create_tray_icon(printing=True)
 
         self.tray = QSystemTrayIcon(self._normal_icon, self.app)
-        self.tray.setToolTip(f"Trayprint v{server.APP_VERSION} - Local Print Service (Port {port})")
+        # Build a rich tooltip with status information
+        self._update_tooltip_text()
 
         self.menu = QMenu()
         self.tray.setContextMenu(self.menu)
@@ -127,14 +136,80 @@ class TrayApp:
         # Track dialogs (prevent multiple instances)
         self._queue_dialog = None
         self._notification_dialog = None
+        self._update_dialog_shown = False
 
         # Polling timer: check server printing state every 2 seconds
         self._state_timer = QTimer(self.app)
         self._state_timer.timeout.connect(self._poll_printing_state)
         self._state_timer.start(2000)
 
+        # ── Auto-Update Checker ──
+        self._update_checker = None
+        self._init_update_checker()
+
+        # ── WebSocket Client (optional, for real-time updates) ──
+        self._ws_client = None
+
         self.tray.show()
         log.info("Tray icon initialized (PySide6) — API on port %d", port)
+
+    def _init_update_checker(self):
+        """Initialize the UpdateChecker from config settings."""
+        config = get_config()
+        hub_url = config.get("hub_url", "")
+        agent_key = config.get("agent_key", "")
+        if not hub_url or not agent_key:
+            log.debug("UpdateChecker: hub not configured, skipping")
+            return
+
+        self._update_checker = UpdateChecker(
+            hub_url=hub_url,
+            agent_key=agent_key,
+            check_interval=86400,  # daily
+            on_update_available=self._on_update_available,
+        )
+        self._update_checker.start()
+        log.info("UpdateChecker started (hub=%s)", hub_url)
+
+    def _on_update_available(self, version, release_notes):
+        """Callback when an update is detected."""
+        log.info("Update available: v%s", version)
+        msg = f"Update v{version} available — open Settings to install"
+        if release_notes:
+            msg += f"\n\nRelease notes:\n{release_notes[:200]}"
+        self.show_notification("Update Available", msg)
+        self._update_dialog_shown = False
+
+    # ── Config reload (apply settings without restart) ──
+
+    def reload_config(self):
+        """Re-read config.json and apply changes live without restarting."""
+        log.info("Reloading config from disk...")
+        try:
+            config = get_config()
+            old_hub_url = server._hub_url
+
+            # Reload server-side config
+            server.reload_config()
+
+            new_hub_url = config.get("hub_url", "")
+            agent_key = config.get("agent_key", "")
+            interval = config.get("sync_interval_seconds", 60)
+
+            # If hub URL changed, restart the hub sync with new settings
+            if new_hub_url and new_hub_url != old_hub_url:
+                log.info("Hub URL changed: %s → %s", old_hub_url, new_hub_url)
+                if agent_key:
+                    max_retries = config.get("max_retries", 3)
+                    retry_delay = config.get("retry_delay_seconds", 60)
+                    server.start_hub_sync(new_hub_url, agent_key, interval, max_retries, retry_delay)
+
+            # Update tray tooltip
+            self.tray.setToolTip(f"Trayprint v{server.APP_VERSION} - Local Print Service (Port {self.port})")
+
+            log.info("Config reloaded successfully — settings applied live")
+        except Exception as e:
+            log.error("Failed to reload config: %s", e)
 
     # ── Printing state management ──
 
@@ -153,12 +228,36 @@ class TrayApp:
         """Update tray icon and tooltip based on printing state."""
         if self._is_printing:
             self.tray.setIcon(self._printing_icon)
-            base = self.tray.toolTip().split('\n')[0]
-            self.tray.setToolTip(base + "\n🖨️ Printing...")
         else:
             self.tray.setIcon(self._normal_icon)
-            base = self.tray.toolTip().split('\n')[0]
-            self.tray.setToolTip(base)
+        self._update_tooltip_text()
+
+    def _update_tooltip_text(self):
+        """Build a rich tooltip showing connection status, printer count, and queue length."""
+        hub_status = server.get_hub_status()
+        printer_count = server.get_cached_printer_count()
+        try:
+            queue_info = server.get_queue_status()
+            queue_depth = queue_info.get('total_queued', 0)
+            processing_count = queue_info.get('processing', 0)
+        except Exception:
+            queue_depth = 0
+            processing_count = 0
+
+        printing_indicator = ""
+        try:
+            if server.is_printing():
+                printing_indicator = "\n🖨️ Printing..."
+        except Exception:
+            pass
+
+        self.tray.setToolTip(
+            f"TrayPrint v{server.APP_VERSION} — Port {self.port}\n"
+            f"Hub: {hub_status}\n"
+            f"Printers: {printer_count}\n"
+            f"Queue: {queue_depth} pending ({processing_count} processing)"
+            f"{printing_indicator}"
+        )
 
     # ── Menu building ──
 
@@ -195,10 +294,24 @@ class TrayApp:
 
         self.menu.addSeparator()
 
+        # ── Diagnostics action ──
+        diagnostics_act = self.menu.addAction("Diagnostics...")
+        diagnostics_act.triggered.connect(self.open_diagnostics)
+
         # ── Show Notifications action ──
         notif_count = len(self.notification_history)
         notif_act = self.menu.addAction(f"Show Notifications{f' ({notif_count})' if notif_count else ''}...")
         notif_act.triggered.connect(self.open_notification_history)
+
+        # ── Check for Updates ──
+        if self._update_checker:
+            if self._update_checker.update_ready:
+                check_upd_act = self.menu.addAction(
+                    f"\u2b06 Update v{self._update_checker.latest_version} Available"
+                )
+            else:
+                check_upd_act = self.menu.addAction("Check for Updates...")
+            check_upd_act.triggered.connect(self.check_for_updates)
 
         # ── Settings ──
         settings_act = self.menu.addAction("Settings")
@@ -252,10 +365,41 @@ class TrayApp:
         self._notification_dialog.destroyed.connect(lambda: setattr(self, '_notification_dialog', None))
         self._notification_dialog.show()
 
-    # ── Existing methods ──
+    def open_diagnostics(self):
+        """Open the diagnostics dialog."""
+        dlg = DiagnosticsDialog()
+        dlg.exec()
 
     def open_settings_window(self):
-        ui_settings.show_settings()
+        """Open the settings dialog with apply callback."""
+        dlg = ui_settings.SettingsWindow()
+        dlg.apply_callback = self.reload_config
+        # Pass the update checker reference for the Software Updates section
+        if hasattr(self, '_update_checker') and self._update_checker:
+            dlg.update_checker = self._update_checker
+        dlg.exec()
+
+    def check_for_updates(self):
+        """Trigger an immediate update check."""
+        if not self._update_checker:
+            self.show_notification("Update Check", "Update checker not configured (hub not set up)")
+            return
+
+        self.show_notification("Update Check", "Checking for updates...")
+        # Run check in a thread to avoid blocking the UI
+        def _do_check():
+            try:
+                self._update_checker.check_for_updates()
+                if self._update_checker.update_ready:
+                    self.show_notification(
+                        "Update Available",
+                        f"v{self._update_checker.latest_version} is available — open Settings to install"
+                    )
+                else:
+                    self.show_notification("Update Check", "You're up to date!")
+            except Exception as e:
+                self.show_notification("Update Check Failed", str(e))
+        threading.Thread(target=_do_check, daemon=True).start()
 
     def populate_jobs_menu(self, menu):
         jobs = server._job_queue.list_recent(10)
@@ -274,6 +418,8 @@ class TrayApp:
         log_path = get_log_path()
         if sys.platform == 'win32':
             os.startfile(log_path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', log_path])
         else:
             subprocess.Popen(['xdg-open', log_path])
 
@@ -293,8 +439,34 @@ class TrayApp:
 
     def quit_app(self):
         log.info("User requested exit")
+        # Stop WebSocket client if running
+        if self._ws_client:
+            try:
+                self._ws_client.stop()
+            except Exception as e:
+                log.warning("Error stopping WebSocket client: %s", e)
         QCoreApplication.quit()
         os._exit(0)
+
+    def closeEvent(self, event):
+        """Override the window close event to minimize to tray instead of quitting."""
+        log.debug("Close event intercepted — minimizing to tray")
+        event.ignore()
+        self._hide_window()
+
+    def _hide_window(self):
+        """Hide any visible dialogs to the tray instead of closing."""
+        if self._queue_dialog and self._queue_dialog.isVisible():
+            self._queue_dialog.hide()
+        if self._notification_dialog and self._notification_dialog.isVisible():
+            self._notification_dialog.hide()
+        # Show a notification to inform the user the app is still running
+        self.tray.showMessage(
+            "TrayPrint",
+            "Application minimized to tray. Double-click the tray icon to restore.",
+            QSystemTrayIcon.Information,
+            3000
+        )
 
     def show_notification(self, title, message):
         """Shows a toast notification AND stores it in notification history."""
@@ -313,10 +485,59 @@ class TrayApp:
         server_thread.daemon = True
         server_thread.start()
 
+        # Start hub sync loop immediately (don't wait for Flask factory)
+        # This ensures status auto-connects on startup rather than staying "Disconnected"
+        config = get_config()
+        hub_url = config.get("hub_url", "")
+        agent_key = config.get("agent_key", "")
+        if hub_url and agent_key:
+            interval = config.get("sync_interval_seconds", 60)
+            max_retries = config.get("max_retries", 3)
+            retry_delay = config.get("retry_delay_seconds", 60)
+            server.start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
+            log.info("Hub sync loop started from app startup (hub=%s)", hub_url)
+
+        # Start optional WebSocket client for real-time queue updates
+        self._on_ws_event(config)
+
         return self.app.exec()
 
+    def _on_ws_event(self, config):
+        """Start the optional WebSocket client and define event callback."""
+        def _handle_ws_event(event_data):
+            """Callback invoked when a WebSocket event is received from the hub."""
+            event = event_data.get('event', '')
+            channel = event_data.get('channel', '')
+            data = event_data.get('data', {})
+            log.debug("WebSocket event: %s on %s", event, channel)
 
-def setup_tray(port):
+            # Queue updated — request immediate queue poll
+            if event == 'queue.updated':
+                log.info("Queue update received via WebSocket, requesting refresh")
+                try:
+                    server.request_queue_refresh()
+                except Exception as e:
+                    log.warning("Queue refresh request error: %s", e)
+
+            # Job status changes — show a notification
+            elif event == 'job.status.updated':
+                job_data = data if isinstance(data, dict) else {}
+                job_id = job_data.get('job_id', '?')
+                status = job_data.get('status', '?')
+                self.show_notification("Job Update", f"Job {job_id}: {status}")
+
+        # Start WebSocket client in background
+        self._ws_client = websocket_client.start_websocket_client(
+            config=config,
+            on_event=_handle_ws_event,
+        )
+        if self._ws_client:
+            log.info("WebSocket real-time client started")
+        else:
+            log.info("WebSocket client not started (will use polling fallback)")
+
+
+def setup_tray(port, config=None):
     app = TrayApp(port)
     sys.exit(app.run())
 
@@ -330,4 +551,4 @@ if __name__ == '__main__':
         for err in config_errors:
             log.warning("Config validation: %s", err)
 
-    setup_tray(config.get('port', 49211))
+    setup_tray(config.get('port', 49211), config)

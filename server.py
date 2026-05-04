@@ -1,17 +1,19 @@
 import json
 import os
+import sys
 import uuid
 import time
+import subprocess
+import platform as _platform
 from datetime import datetime
 from collections import OrderedDict
 import threading
 
-START_TIME = time.time()
+start_time = time.time()
 
-from flask import Flask, request, jsonify, render_template
 import printer
 from path_utils import get_root_dir
-from logger import get_logger
+from logger import get_logger, get_log_path
 
 log = get_logger()
 
@@ -186,6 +188,9 @@ class JobQueue:
 _job_queue = JobQueue()
 _notification_callback = None
 
+# ── Queue refresh request (for WebSocket-triggered immediate poll) ──
+_queue_refresh_request = threading.Event()
+
 # ── Printing state (for tray indicator) ──
 _is_printing = False
 _printing_lock = threading.Lock()
@@ -204,6 +209,11 @@ def _set_printing(state: bool):
     with _printing_lock:
         global _is_printing
         _is_printing = state
+
+def request_queue_refresh():
+    """Signal the sync loop to poll the queue immediately on its next iteration."""
+    _queue_refresh_request.set()
+
 
 def get_queue_status():
     """
@@ -313,12 +323,23 @@ import queue as _queue
 _internal_print_queue = _queue.Queue()
 _hub_last_status = "Disconnected"
 _cached_printer_count = 0
+_cached_printer_count_lock = threading.Lock()
 
 def get_hub_status():
     return _hub_last_status
 
 def get_cached_printer_count():
-    return _cached_printer_count
+    """Return the cached printer count, falling back to direct enumeration if not yet seeded."""
+    global _cached_printer_count
+    with _cached_printer_count_lock:
+        if _cached_printer_count == 0:
+            try:
+                printers_list = printer.get_printers()
+                _cached_printer_count = len(printers_list)
+                log.info("get_cached_printer_count: fallback enumeration found %d printer(s)", _cached_printer_count)
+            except Exception as e:
+                log.debug("get_cached_printer_count: fallback failed: %s", e)
+        return _cached_printer_count
 
 def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
     """Periodically pull profiles and print queue from the central hub."""
@@ -400,6 +421,12 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
                 log.debug("Hub sync failed (hub may be offline): %s", e)
                 _hub_last_status = "Offline"
 
+            # Check for queue refresh request (e.g., from WebSocket event)
+            if _queue_refresh_request.is_set():
+                _queue_refresh_request.clear()
+                log.debug("Queue refresh requested, resetting backoff")
+                backoff = 1
+
             # Exponential backoff
             if jobs_found:
                 backoff = 1
@@ -421,6 +448,12 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
             job_type = hub_job['type']
             options = hub_job['options'] or {}
             b64_data = hub_job.get('document_base64')
+
+            # Skip jobs pending approval
+            approval_status = hub_job.get('approval_status', 'auto_approved')
+            if approval_status == 'pending':
+                log.info("Job %s skipped — pending approval", job_id)
+                return False
 
             # Resolve profile from job options if available
             profile_name = options.get('profile') or options.get('queue')
@@ -547,7 +580,7 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
     log.info("Hub sync & spooler started → %s (every %ds)", hub_url, interval)
 
 def report_status_to_hub(hub_url, agent_key):
-    """Report local status (printers) to the central hub."""
+    """Report local status (printers + capabilities) to the central hub."""
     import requests
     if not hub_url:
         return
@@ -559,8 +592,25 @@ def report_status_to_hub(hub_url, agent_key):
         global _cached_printer_count
         _cached_printer_count = len(printers_list)
 
+        # Build capabilities for each printer (fire-and-forget discovery on each report)
+        capabilities_dict = {}
+        try:
+            import capabilities as caps_mod
+            for p in printers_list:
+                name = p.get('name', '')
+                if name:
+                    try:
+                        caps = caps_mod.discover_capabilities(name)
+                        if 'error' not in caps:
+                            capabilities_dict[name] = caps
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         payload = {
-            'printers': [p['name'] for p in printers_list]
+            'printers': [p['name'] for p in printers_list],
+            'capabilities': capabilities_dict,
         }
         resp = requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
         global _hub_last_status
@@ -569,7 +619,7 @@ def report_status_to_hub(hub_url, agent_key):
             data = _check_hub_response(json_data, "status report")
             if data is not None:
                 _hub_last_status = "Connected"
-                log.info("Reported %d printers to hub", len(printers_list))
+                log.info("Reported %d printers (+ capabilities) to hub", len(printers_list))
             else:
                 _hub_last_status = "Offline (API error)"
         else:
@@ -608,6 +658,228 @@ def report_job_to_hub(hub_url, agent_key, job):
 
 
 # ─────────────────────────────────────────────
+#  Hub Connection Test
+# ─────────────────────────────────────────────
+
+def test_hub_connection():
+    """Test if the configured hub is reachable. Returns True/False."""
+    import requests
+    config_path = os.path.join(get_root_dir(), 'config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            hub_url = data.get('hub_url', '')
+            agent_key = data.get('agent_key', '')
+            if not hub_url or not agent_key:
+                return False
+            headers = {'Authorization': f'Bearer {agent_key}'}
+            resp = requests.get(f'{hub_url}/api/print-hub/heartbeat', headers=headers, timeout=5)
+            return resp.status_code == 200
+        return False
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────
+#  Watchdog — Spooler / CUPS Monitor
+# ─────────────────────────────────────────────
+
+_watchdog_thread = None
+_watchdog_status = {
+    "running": False,
+    "last_check": None,
+    "restart_attempts": 0,
+}
+_watchdog_status_lock = threading.Lock()
+
+class WatchdogThread(threading.Thread):
+    """Periodically checks if the print spooler is still running."""
+
+    def __init__(self, check_interval=60):
+        super().__init__(daemon=True)
+        self.check_interval = check_interval
+        self._stop_event = threading.Event()
+        self._restart_attempts = 0
+        self._consecutive_failures = 0
+
+    def run(self):
+        log.info("Watchdog started (interval=%ds)", self.check_interval)
+        with _watchdog_status_lock:
+            _watchdog_status["running"] = True
+            _watchdog_status["last_check"] = None
+            _watchdog_status["restart_attempts"] = 0
+
+        while not self._stop_event.is_set():
+            self._perform_check()
+            self._stop_event.wait(self.check_interval)
+
+        with _watchdog_status_lock:
+            _watchdog_status["running"] = False
+        log.info("Watchdog stopped")
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _check_windows_spooler(self):
+        """Check if spoolsv.exe is running on Windows."""
+        try:
+            import psutil
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and proc.info['name'].lower() == 'spoolsv.exe':
+                    return True
+            return False
+        except ImportError:
+            # Fallback using tasklist
+            try:
+                result = subprocess.run(
+                    ['tasklist', '/FI', 'IMAGENAME eq spoolsv.exe'],
+                    capture_output=True, text=True, timeout=10
+                )
+                return 'spoolsv.exe' in result.stdout
+            except Exception:
+                return True  # Assume running if we can't check
+
+    def _check_linux_cups(self):
+        """Check if CUPS scheduler is running on Linux/macOS."""
+        try:
+            result = subprocess.run(
+                ['lpstat', '-r'],
+                capture_output=True, text=True, timeout=10
+            )
+            return 'scheduler is running' in result.stdout
+        except Exception:
+            return True  # Assume running if we can't check
+
+    def _check_macos_cups(self):
+        """Check if CUPS is running on macOS via cupsctl or lpstat."""
+        try:
+            # macOS: check via cupsctl or lpstat
+            result = subprocess.run(
+                ['cupsctl'],
+                capture_output=True, text=True, timeout=10
+            )
+            # cupsctl returns 0 if CUPS is running
+            return result.returncode == 0
+        except FileNotFoundError:
+            # Fallback to lpstat
+            try:
+                result = subprocess.run(
+                    ['lpstat', '-r'],
+                    capture_output=True, text=True, timeout=10
+                )
+                return 'scheduler is running' in result.stdout
+            except Exception:
+                return True
+        except Exception:
+            return True
+
+    def _perform_check(self):
+        """Check spooler health and attempt restart if needed."""
+        try:
+            if _platform.system() == 'Windows':
+                alive = self._check_windows_spooler()
+            elif _platform.system() == 'Darwin':
+                alive = self._check_macos_cups()
+            else:
+                alive = self._check_linux_cups()
+
+            if not alive:
+                self._consecutive_failures += 1
+                log.warning("Watchdog: spooler check failed (%d/3)", self._consecutive_failures)
+                if self._consecutive_failures >= 3:
+                    log.warning("Watchdog: spooler appears dead, attempting restart...")
+                    self._attempt_restart()
+                    self._consecutive_failures = 0
+            else:
+                if self._consecutive_failures > 0:
+                    log.info("Watchdog: spooler recovered after %d failures", self._consecutive_failures)
+                self._consecutive_failures = 0
+        except Exception as e:
+            log.error("Watchdog check error: %s", e)
+
+    def _attempt_restart(self):
+        """Try to restart the spooler service."""
+        self._restart_attempts += 1
+        try:
+            if _platform.system() == 'Windows':
+                result = subprocess.run(
+                    ['net', 'start', 'spoolsv'],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    log.info("Watchdog: spoolsv.exe restarted successfully")
+                else:
+                    log.warning("Watchdog: failed to restart spoolsv.exe: %s", result.stderr)
+            elif _platform.system() == 'Darwin':
+                # macOS: restart CUPS via launchctl
+                try:
+                    result = subprocess.run(
+                        ['sudo', 'launchctl', 'kickstart', '-k', 'system/org.cups.cupsd'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                except FileNotFoundError:
+                    result = subprocess.run(
+                        ['sudo', 'cupsctl', '--reset'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                if result.returncode == 0:
+                    log.info("Watchdog: macOS CUPS restarted successfully")
+                else:
+                    log.warning("Watchdog: failed to restart macOS CUPS: %s", result.stderr)
+            else:
+                # Try systemctl first, then service fallback
+                try:
+                    result = subprocess.run(
+                        ['sudo', 'systemctl', 'start', 'cups'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                except FileNotFoundError:
+                    result = subprocess.run(
+                        ['sudo', 'service', 'cups', 'start'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                if result.returncode == 0:
+                    log.info("Watchdog: CUPS restarted successfully")
+                else:
+                    log.warning("Watchdog: failed to restart CUPS: %s", result.stderr)
+        except Exception as e:
+            log.error("Watchdog restart failed: %s", e)
+
+
+# ─────────────────────────────────────────────
+#  reload_config — Apply settings live
+# ─────────────────────────────────────────────
+
+_hub_url = ""
+_agent_key = ""
+
+def reload_config():
+    """Re-read config.json and update runtime state without restarting."""
+    global _hub_url, _agent_key, _allowed_origins
+    config_path = os.path.join(get_root_dir(), 'config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            _hub_url = data.get('hub_url', '')
+            _agent_key = data.get('agent_key', '')
+            if 'allowed_origins' in data:
+                _allowed_origins = data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
+            load_profiles_from_config()
+            log.info("Config reloaded: hub_url=%s, profiles=%d", _hub_url, len(_profiles))
+            return True
+    except Exception as e:
+        log.error("Error reloading config: %s", e)
+    return False
+
+def get_watchdog_status():
+    """Return the current watchdog status dict."""
+    with _watchdog_status_lock:
+        return dict(_watchdog_status)
+
+
+# ─────────────────────────────────────────────
 #  Flask App Factory
 # ─────────────────────────────────────────────
 
@@ -619,6 +891,7 @@ def get_resource_path(relative_path):
     return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
 
 def create_app():
+    from flask import Flask, request, jsonify, render_template
     app = Flask(__name__, template_folder=get_resource_path('templates'))
 
     # Load settings
@@ -668,16 +941,9 @@ def create_app():
     # Load local profiles
     load_profiles_from_config()
 
-    # Start hub sync if configured
+    # Store hub config for job-reporting (sync is started from app.py)
     hub_url = config_data.get('hub_url', '')
     agent_key = config_data.get('agent_key', '')
-    if hub_url:
-        interval = config_data.get('sync_interval_seconds', 60)
-        max_retries = config_data.get('max_retries', 3)
-        retry_delay = config_data.get('retry_delay_seconds', 60)
-        start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
-
-    # Store hub config for job-reporting
     app.config['HUB_URL'] = hub_url
     app.config['AGENT_KEY'] = agent_key
 
@@ -686,7 +952,7 @@ def create_app():
     @app.route('/status', methods=['GET'])
     def status():
         pending = len([j for j in _job_queue.list_recent(50) if j['status'] == 'pending'])
-        uptime = int(time.time() - START_TIME)
+        uptime = int(time.time() - start_time)
         return jsonify({
             "status": "running",
             "version": APP_VERSION,
@@ -846,10 +1112,82 @@ def create_app():
             "is_printing": is_printing()
         }), 200
 
+    # ── Capabilities ──
+
+    @app.route('/api/capabilities', methods=['GET'])
+    def capabilities_route():
+        """Return capabilities for a specific printer or all printers."""
+        import capabilities as caps_mod
+        printer_name = request.args.get('printer')
+        if printer_name:
+            caps = caps_mod.discover_capabilities(printer_name)
+            return jsonify({"capabilities": caps}), 200
+        else:
+            all_caps = caps_mod.discover_all_printers_capabilities()
+            return jsonify({"capabilities": all_caps}), 200
+
+    @app.route('/api/capabilities/all', methods=['GET'])
+    def all_capabilities_route():
+        """Return capabilities for all printers on this system."""
+        import capabilities as caps_mod
+        all_caps = caps_mod.discover_all_printers_capabilities()
+        return jsonify({"capabilities": all_caps}), 200
+
+    # ── Diagnostics ──
+
+    @app.route('/api/diagnostics', methods=['GET'])
+    def diagnostics():
+        """Return full diagnostics data for the TrayPrint agent."""
+        config_path = os.path.join(get_root_dir(), 'config.json')
+        config_exists = os.path.exists(config_path)
+        cfg = {}
+        if config_exists:
+            try:
+                with open(config_path, 'r') as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+
+        hub_url = cfg.get('hub_url', '')
+        printers_list = printer.get_printers()
+        queue = _job_queue.list_recent(50)
+        running_uptime = time.time() - start_time
+        hours = int(running_uptime // 3600)
+        minutes = int((running_uptime % 3600) // 60)
+        seconds = int(running_uptime % 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+        wd_status = get_watchdog_status()
+
+        return jsonify({
+            "app_version": APP_VERSION,
+            "python_version": sys.version,
+            "platform": sys.platform,
+            "run_mode": "packaged" if getattr(sys, 'frozen', False) else "dev",
+            "config_path": config_path,
+            "config_exists": config_exists,
+            "hub_url": hub_url,
+            "hub_connected": test_hub_connection(),
+            "printer_count": len(printers_list),
+            "printers": [p['name'] for p in printers_list],
+            "queue_length": len(queue),
+            "uptime": uptime_str,
+            "log_file": get_log_path(),
+            "os_details": _platform.platform(),
+            "watchdog": wd_status,
+        }), 200
+
+    # ── Watchdog Status ──
+
+    @app.route('/api/watchdog/status', methods=['GET'])
+    def watchdog_status_route():
+        return jsonify(get_watchdog_status()), 200
+
     return app
 
 
 def run_server(port):
+    global _watchdog_thread
     app = create_app()
     import logging as stdlib_logging
     werkzeug_log = stdlib_logging.getLogger('werkzeug')
@@ -859,11 +1197,35 @@ def run_server(port):
     # Perform an initial printer check to populate the cache
     try:
         # Pre-populate printer list for the local UI even without hub
-        printer.get_printers()
+        printers_list = printer.get_printers()
+        global _cached_printer_count
+        with _cached_printer_count_lock:
+            _cached_printer_count = len(printers_list)
+        log.info("Initial printer check: found %d printer(s)", _cached_printer_count)
+    except Exception:
+        pass
+
+    # Start watchdog thread
+    _watchdog_thread = WatchdogThread(check_interval=60)
+    _watchdog_thread.start()
+
+    # Register shutdown handler to stop watchdog on exit
+    try:
+        from flask import request
+        @app.teardown_appcontext
+        def shutdown_watchdog(exception=None):
+            if _watchdog_thread and _watchdog_thread.is_alive():
+                _watchdog_thread.stop()
+                _watchdog_thread.join(timeout=3)
+                log.info("Watchdog stopped during server shutdown")
     except Exception:
         pass
 
     app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)
+
+    # Ensure watchdog stops after server exits
+    if _watchdog_thread and _watchdog_thread.is_alive():
+        _watchdog_thread.stop()
 
 
 if __name__ == '__main__':

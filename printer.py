@@ -1,6 +1,8 @@
 import sys
 import os
 import subprocess
+import platform
+import tempfile
 from logger import get_logger
 
 # Windows-specific imports
@@ -118,6 +120,12 @@ def get_printers():
                 })
         except Exception as e:
             log.error("Error enumerating windows printers: %s", e, exc_info=True)
+    elif is_macos():
+        try:
+            import platform_darwin
+            printers = platform_darwin.get_printers_macos()
+        except Exception as e:
+            log.error("Error enumerating macOS printers: %s", e)
     else:
         try:
             result = subprocess.run(['lpstat', '-a'], capture_output=True, text=True, check=True)
@@ -148,6 +156,12 @@ def get_default_printer():
             return ''
         try:
             return win32print.GetDefaultPrinter()
+        except Exception:
+            return ''
+    elif is_macos():
+        try:
+            import platform_darwin
+            return platform_darwin.get_default_printer_macos()
         except Exception:
             return ''
     else:
@@ -279,6 +293,45 @@ def _build_lp_options(options):
     if reverse_order:
         args += ['-o', 'OutputOrder=reverse']
         log.debug("CUPS: OutputOrder=reverse")
+
+    # ─────────────────────────────────────────────
+    # 13. Finishing Options (Staple, Punch, Booklet, Fold)
+    # ─────────────────────────────────────────────
+    # Staple — IPP "finishings" collection
+    staple = options.get('finishing_staple')
+    if staple:
+        if staple == 'single':
+            args += ['-o', 'StapleLocation=SinglePortrait']
+            log.debug("CUPS: StapleLocation=SinglePortrait")
+        elif staple == 'dual':
+            args += ['-o', 'StapleLocation=DualPortrait']
+            log.debug("CUPS: StapleLocation=DualPortrait")
+        elif staple == 'saddle':
+            args += ['-o', 'StapleLocation=SaddleStitch']
+            log.debug("CUPS: StapleLocation=SaddleStitch")
+
+    # Punch — IPP "punch" finishings
+    punch = options.get('finishing_punch')
+    if punch:
+        args += ['-o', f'Punch={punch}']
+        log.debug("CUPS: Punch=%s", punch)
+
+    # Booklet — 2-up + reverse stack via number-up
+    booklet = options.get('finishing_booklet')
+    if booklet:
+        args += ['-o', 'number-up=2', '-o', 'page-set=all']
+        log.debug("CUPS: booklet mode (number-up=2)")
+
+    # Fold — IPP "fold" finishings
+    fold = options.get('finishing_fold')
+    if fold:
+        if fold == 'half':
+            args += ['-o', 'Fold=Half']
+        elif fold == 'tri-fold':
+            args += ['-o', 'Fold=TriFold']
+        elif fold == 'z-fold':
+            args += ['-o', 'Fold=ZFold']
+        log.debug("CUPS: Fold=%s", fold)
 
     return args
 
@@ -541,6 +594,19 @@ def _build_sumatra_options(options, printer_name=None):
         extra_args.append('-color')
         log.debug("SumatraPDF: color mode")
 
+    # ── Finishing Options (SumatraPDF does not support staple/punch/fold natively) ──
+    finishing_opts = any([
+        options.get('finishing_staple'),
+        options.get('finishing_punch'),
+        options.get('finishing_booklet'),
+        options.get('finishing_fold'),
+        options.get('finishing_bind'),
+    ])
+    if finishing_opts:
+        log.warning("SumatraPDF: finishing options (%s) not supported natively; using driver defaults",
+                    ', '.join(k for k in ['finishing_staple', 'finishing_punch', 'finishing_booklet',
+                                          'finishing_fold', 'finishing_bind'] if options.get(k)))
+
     if parts:
         return ['-print-settings', ','.join(parts)] + extra_args
     return extra_args
@@ -584,6 +650,11 @@ def print_raw(printer_name, data_str, options=None):
                     options.get('collate') is not None,
                     options.get('copies'),
                     options.get('media_type'),
+                    options.get('finishing_staple'),
+                    options.get('finishing_punch'),
+                    options.get('finishing_booklet'),
+                    options.get('finishing_fold'),
+                    options.get('finishing_bind'),
                 ])
                 if options and has_devmode_opts:
                     try:
@@ -695,6 +766,18 @@ def print_raw(printer_name, data_str, options=None):
         except Exception as e:
             error_msg = str(e)
             log.error("Windows raw print error: %s", e)
+    elif is_macos():
+        try:
+            cmd = ['lp', '-d', printer_name, '-o', 'raw']
+            cmd += _build_lp_options(options)
+            subprocess.run(cmd, input=raw_bytes, capture_output=True, check=True)
+            success = True
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+            log.error("macOS raw print error: %s", error_msg)
+        except Exception as e:
+            error_msg = str(e)
+            log.error("macOS raw print exception: %s", e)
     else:
         try:
             cmd = ['lp', '-d', printer_name, '-o', 'raw']
@@ -901,6 +984,15 @@ def _create_devmode_for_options(printer_name, options):
                     devmode.Fields |= win32con.DM_MEDIATYPE
                     modified = True
                     log.info("DevMode: MediaType=%d (%s)", devmode.MediaType, mt)
+
+            # ── 7. Finishing Options (DEVMODE does not support staple/punch/fold directly) ──
+            # DEVMODE has limited finishing support. We log the request and use
+            # DM_PRINTQUALITY-adjacent fields if available, but most staple/punch/fold
+            # options are driver-specific extended fields not covered by DEVMODE.
+            finishing_booklet = options.get('finishing_booklet')
+            if finishing_booklet:
+                # Booklet can be approximated via duplex + 2-up in some drivers
+                log.info("DevMode: booklet mode requested (driver-dependent)")
             
             if modified:
                 if paper_id:
@@ -1218,6 +1310,13 @@ def print_pdf(printer_name, pdf_base64, options=None):
 
         if is_windows():
             success, error_msg = _print_pdf_windows(printer_name, temp_path, options)
+        elif is_macos():
+            try:
+                import platform_darwin
+                success, error_msg = platform_darwin.print_file_macos(printer_name, temp_path, options)
+            except Exception as e:
+                error_msg = str(e)
+                log.error("macOS PDF Print Error: %s", error_msg)
         else:
             try:
                 cmd = ['lp', '-d', printer_name]

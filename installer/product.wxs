@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!--
+    TrayPrint — WiX Toolset v3.x Installer Definition
+
+    Build with:
+      candle.exe product.wxs
+      light.exe -out TrayPrint.msi product.wixobj
+
+    Prerequisites:
+      - WiX Toolset v3.14 or later (https://wixtoolset.org)
+      - Built TrayPrint executable (trayprint.exe) in the parent directory
+  -->
+
+  <Product
+    Id="*"
+    Name="TrayPrint"
+    Language="1033"
+    Version="1.0.0"
+    Manufacturer="Print Hub"
+    UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+  >
+    <Package
+      InstallerVersion="200"
+      Compressed="yes"
+      InstallScope="perMachine"
+      Platform="x64"
+      Description="TrayPrint – Local Print Agent for Print Hub"
+      Comments="TrayPrint v1.0.0 — Windows Print Agent"
+      Manufacturer="Print Hub"
+    />
+
+    <!-- The product is a 64-bit application. -->
+    <Condition Message="This installer requires a 64-bit version of Windows.">
+      VersionNT64
+    </Condition>
+
+    <!-- Directory structure -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="TrayPrint">
+          <!-- Main executable -->
+          <Component Id="C_TrayPrintExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901" Win64="yes">
+            <File
+              Id="F_TrayPrintExe"
+              Name="trayprint.exe"
+              Source="..\dist\trayprint.exe"
+              KeyPath="yes"
+              Checksum="yes"
+            />
+
+            <!-- Shortcut in Start Menu -->
+            <Shortcut
+              Id="StartMenuShortcut"
+              Directory="ProgramMenuDir"
+              Name="TrayPrint"
+              WorkingDirectory="APPLICATIONFOLDER"
+              Icon="TrayPrintIcon"
+            />
+          </Component>
+
+          <!-- Configuration file (created on first launch) -->
+          <Component Id="C_ConfigJson" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012" Win64="yes">
+            <File
+              Id="F_ConfigJson"
+              Name="config.json"
+              Source="..\config.json"
+              KeyPath="yes"
+            />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <!-- Start Menu folder -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="TrayPrint" />
+      </Directory>
+
+      <!-- Desktop shortcut folder -->
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <!-- Desktop shortcut -->
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="C_DesktopShortcut" Guid="D4E5F6A7-B8C9-0123-DEF1-234567890123" Win64="yes">
+        <Shortcut
+          Id="DesktopShortcut"
+          Directory="DesktopFolder"
+          Name="TrayPrint"
+          WorkingDirectory="APPLICATIONFOLDER"
+          Target="[APPLICATIONFOLDER]trayprint.exe"
+          Icon="TrayPrintIcon"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\PrintHub\TrayPrint"
+          Name="DesktopShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Features -->
+    <Feature Id="F_MainApplication" Title="TrayPrint" Level="1" Description="TrayPrint executable and configuration.">
+      <ComponentRef Id="C_TrayPrintExe" />
+      <ComponentRef Id="C_ConfigJson" />
+      <ComponentRef Id="C_DesktopShortcut" />
+      <ComponentRef Id="C_AutoStartRegistry" />
+    </Feature>
+
+    <!-- Auto-start via HKCU\Software\Microsoft\Windows\CurrentVersion\Run -->
+    <DirectoryRef Id="APPLICATIONFOLDER">
+      <Component Id="C_AutoStartRegistry" Guid="E5F6A7B8-C9D0-1234-EF12-345678901234" Win64="yes">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="TrayPrint"
+          Type="string"
+          Value="[APPLICATIONFOLDER]trayprint.exe"
+          KeyPath="yes"
+        />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Icon reference -->
+    <Icon Id="TrayPrintIcon" SourceFile="..\trayprint.ico" />
+
+    <!-- UI — use the standard WiX MSI dialog set -->
+    <UIRef Id="WixUI_Minimal" />
+
+    <!-- Allow upgrading from previous versions -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of TrayPrint is already installed."
+      Schedule="afterInstallValidate"
+    />
+
+    <!-- Custom action to run TrayPrint after installation -->
+    <CustomAction
+      Id="LaunchApplication"
+      FileKey="F_TrayPrintExe"
+      ExeCommand=""
+      Execute="immediate"
+      Return="asyncNoWait"
+    />
+
+    <InstallExecuteSequence>
+      <Custom Action="LaunchApplication" After="InstallFinalize">NOT Installed</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>
