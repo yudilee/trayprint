@@ -31,6 +31,8 @@
 
 - **Per-Printer Configuration** — Configure defaults for each printer independently, saved in [`config.json`](config.json) as `printer_configs`
 - **Capability Discovery** — Automatically detects supported trays, resolutions, media sizes, color modes, and duplex via [`capabilities.py`](capabilities.py) using win32print.DeviceCapabilities (Windows) or `lpoptions -l` (CUPS)
+- **Refresh Capabilities Button** — Per-printer "Refresh Capabilities" button in the settings dialog that re-queries the print subsystem for the latest supported options and updates dropdowns in real time
+- **Thread-Safe UI Update** — Capability refresh runs in a background thread and delivers results to the UI via a polling timer (avoids PySide6 `QTimer.singleShot` cross-thread issues)
 - **Configuration UI** — Visual settings dialog ([`ui_settings.py`](ui_settings.py)) with per-printer tabbed interface
 - **Batch Apply** — Apply settings to all printers at once via "Apply to All" button
 - **Config Merge** — Runtime merge of saved configs with request-level options via [`merge_printer_config()`](server.py:36)
@@ -200,7 +202,7 @@ The settings dialog ([`ui_settings.py`](ui_settings.py)) has tabbed sections:
 1. **Connection** — Hub URL, API key, test connection button
 2. **Appearance** — Dark/Light theme toggle
 3. **General** — Auto-start on login, auto-update preferences
-4. **Printer Configuration** — Per-printer settings for each discovered printer with "Apply to All" button
+4. **Printer Configuration** — Per-printer settings for each discovered printer with "Apply to All" button; each printer has a **"Refresh Capabilities"** button that re-queries the print subsystem for supported trays, media sizes, color modes, resolutions, and duplex modes, then updates the dropdown widgets accordingly
 5. **Software Updates** — Current version display, check for updates, download & install
 
 ### Diagnostics
@@ -320,8 +322,8 @@ picked ──→ processing ──→ completed
 | [`app.py`](app.py) | Main entry point; initializes QApplication, tray icon, menu, dialogs, WebSocket client, update checker |
 | [`server.py`](server.py) | Flask HTTP server; job queue (SQLite), hub sync loop, printer config merge, REST API endpoints |
 | [`printer.py`](printer.py) | Print backend: printer discovery (win32print/CUPS), job printing (DEVMODE/GDI/lp), temp file management |
-| [`capabilities.py`](capabilities.py) | Printer capability discovery (trays, resolutions, media sizes, color modes, duplex) |
-| [`ui_settings.py`](ui_settings.py) | Settings dialog with tabs for connection, appearance, general, printer configuration, software updates |
+| [`capabilities.py`](capabilities.py) | Printer capability discovery (trays, resolutions, media sizes, color modes, duplex); uses `win32print.DeviceCapabilities` on Windows and `lpoptions -l` on CUPS (Linux/macOS) |
+| [`ui_settings.py`](ui_settings.py) | Settings dialog with tabs for connection, appearance, general, printer configuration, software updates; includes per-printer "Refresh Capabilities" button with thread-safe UI update via polling timer |
 | [`queue_dialog.py`](queue_dialog.py) | Print queue viewer with real-time status, job cancel button |
 | [`diagnostics_dialog.py`](diagnostics_dialog.py) | System health overview with copy-to-clipboard |
 | [`notification_history.py`](notification_history.py) | Persistent notification store and viewer dialog |
