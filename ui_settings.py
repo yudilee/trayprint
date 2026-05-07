@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont, QIcon, QColor, QPalette
 
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 from logger import get_logger
 from theme import get_stylesheet, get_palette
 import server
@@ -83,7 +83,7 @@ class SettingsWindow(QDialog):
         # Optional update checker reference (set by app.py)
         self.update_checker = None
         
-        self.config_path = os.path.join(get_root_dir(), 'config.json')
+        self.config_path = os.path.join(get_data_dir(), 'config.json')
         self.config_data = {
             "port": 49211,
             "sync_interval_seconds": 60,

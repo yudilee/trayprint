@@ -6,24 +6,24 @@ import shutil
 def build():
     """Build the tray app into a standalone executable using PyInstaller."""
     print("=" * 50)
-    print("  Trayprint — Build Script")
+    print("  Trayprint - Build Script")
     print("=" * 50)
 
     # Check PyInstaller
     try:
         import PyInstaller
-        print(f"✓ PyInstaller {PyInstaller.__version__} found")
+        print("[OK] PyInstaller %s found" % PyInstaller.__version__)
     except ImportError:
-        print("✗ PyInstaller not found. Installing...")
+        print("[FAIL] PyInstaller not found. Installing...")
         subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
 
     # Check pywin32 (critical for Windows)
     if sys.platform == 'win32':
         try:
             import win32print
-            print("✓ pywin32 (win32print) found")
+            print("[OK] pywin32 (win32print) found")
         except ImportError:
-            print("✗ pywin32 not found. Installing...")
+            print("[FAIL] pywin32 not found. Installing...")
             subprocess.run([sys.executable, '-m', 'pip', 'install', 'pywin32'], check=True)
             print("! NOTE: If build still fails with 'win32print not found', run this manually on Windows:")
             print("  python Scripts/pywin32_postinstall.py -install")
@@ -34,28 +34,66 @@ def build():
     # Determine platform-specific options
     icon_opt = []
     hidden_imports = [
+        # PySide6
         '--hidden-import=PySide6.QtCore',
         '--hidden-import=PySide6.QtGui',
         '--hidden-import=PySide6.QtWidgets',
+        # Flask & web
         '--hidden-import=flask',
         '--hidden-import=requests',
+        '--hidden-import=websockets',
+        '--hidden-import=websockets.asyncio.client',
+        # Image / PDF
         '--hidden-import=PIL',
+        '--hidden-import=PIL.Image',
         '--hidden-import=fitz',
-        '--hidden-import=ui_settings',
+        # Application modules
         '--hidden-import=server',
+        '--hidden-import=ui_settings',
         '--hidden-import=autostart',
         '--hidden-import=printer',
         '--hidden-import=path_utils',
         '--hidden-import=logger',
+        '--hidden-import=log_utils',
+        '--hidden-import=websocket_client',
+        '--hidden-import=notification_history',
+        '--hidden-import=queue_dialog',
+        '--hidden-import=diagnostics_dialog',
+        '--hidden-import=updater',
+        '--hidden-import=capabilities',
+        '--hidden-import=theme',
+        # Standard library modules used dynamically
         '--hidden-import=difflib',
         '--hidden-import=html',
         '--hidden-import=http',
         '--hidden-import=email',
         '--hidden-import=encodings',
+        '--hidden-import=ctypes',
+        '--hidden-import=sqlite3',
+        '--hidden-import=queue',
+        '--hidden-import=asyncio',
+        '--hidden-import=winreg',
+        '--hidden-import=pathlib',
+        '--hidden-import=hashlib',
+        '--hidden-import=platform',
+        '--hidden-import=socket',
+        '--hidden-import=re',
+        '--hidden-import=base64',
+        '--hidden-import=uuid',
+        '--hidden-import=argparse',
+        '--hidden-import=webbrowser',
+        '--hidden-import=dataclasses',
+        '--hidden-import=typing',
+        '--hidden-import=contextlib',
+        '--hidden-import=collections',
     ]
     
     if sys.platform == 'win32':
-        icon_opt = ['--icon', os.path.join(app_dir, 'trayprint.ico')]
+        icon_path = os.path.join(app_dir, 'trayprint.ico')
+        if os.path.exists(icon_path):
+            icon_opt = ['--icon', icon_path]
+        else:
+            print("! Windows .ico icon not found at %s — will use default" % icon_path)
         hidden_imports += [
             '--hidden-import=win32print',
             '--hidden-import=win32con',

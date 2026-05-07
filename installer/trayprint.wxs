@@ -39,6 +39,8 @@
       Manufacturer="Print Hub"
     />
 
+    <Media Id="1" Cabinet="TrayPrint.cab" EmbedCab="yes" CompressionLevel="high" />
+
     <!-- Require 64-bit Windows -->
     <Condition Message="This installer requires a 64-bit version of Windows.">
       VersionNT64

@@ -14,7 +14,7 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 
 # Module-level logger cache
 _loggers = {}
@@ -87,7 +87,7 @@ def setup_logging(
 
     # File handler with rotation
     if log_dir is None:
-        log_dir = os.path.join(get_root_dir(), "logs")
+        log_dir = os.path.join(get_data_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, log_file)
@@ -131,7 +131,7 @@ def get_log_path(name="trayprint", log_dir=None, log_file="app.log"):
         Full path to the log file.
     """
     if log_dir is None:
-        log_dir = os.path.join(get_root_dir(), "logs")
+        log_dir = os.path.join(get_data_dir(), "logs")
     return os.path.join(log_dir, log_file)
 
 

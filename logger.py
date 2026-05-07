@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 
 _logger = None
 
@@ -27,7 +27,7 @@ def get_logger():
     _logger.addHandler(console)
 
     # File handler with rotation (5MB max, keep 3 backups)
-    log_dir = get_root_dir()
+    log_dir = get_data_dir()
     log_path = os.path.join(log_dir, 'trayprint.log')
     file_handler = RotatingFileHandler(
         log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
@@ -41,4 +41,4 @@ def get_logger():
 
 def get_log_path():
     """Returns the path to the log file."""
-    return os.path.join(get_root_dir(), 'trayprint.log')
+    return os.path.join(get_data_dir(), 'trayprint.log')

@@ -36,7 +36,7 @@ import server
 import websocket_client
 import autostart
 import ui_settings
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 from logger import get_logger, get_log_path
 from log_utils import setup_logging as setup_log_utils
 from notification_history import NotificationHistory, NotificationHistoryDialog
@@ -224,8 +224,8 @@ def install_windows_service():
                 "Local print agent service for Print Hub. "
                 "Provides a REST API for printing.",
                 "Start", "SERVICE_AUTO_START",
-                "AppStdout", os.path.join(get_root_dir(), "logs", "service.log"),
-                "AppStderr", os.path.join(get_root_dir(), "logs", "service.err"),
+                "AppStdout", os.path.join(get_data_dir(), "logs", "service.log"),
+                "AppStderr", os.path.join(get_data_dir(), "logs", "service.err"),
             ],
             check=True,
         )
@@ -1038,7 +1038,7 @@ class TrayApp:
 #  and attempts to upload it to the hub for diagnostics.
 # ─────────────────────────────────────────────
 
-CRASH_LOG_PATH = os.path.join(get_root_dir(), "crash_diagnostics.log")
+CRASH_LOG_PATH = os.path.join(get_data_dir(), "crash_diagnostics.log")
 
 
 def _crash_handler(exc_type, exc_value, exc_traceback):

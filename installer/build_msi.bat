@@ -34,6 +34,9 @@ if %ERRORLEVEL% EQU 0 (
 ) else if defined WIX_TOOLSET_PATH (
     set CANDLE="%WIX_TOOLSET_PATH%\candle.exe"
     set LIGHT="%WIX_TOOLSET_PATH%\light.exe"
+) else if defined WIX (
+    set CANDLE="%WIX%bin\candle.exe"
+    set LIGHT="%WIX%bin\light.exe"
 ) else (
     echo [ERROR] WiX Toolset not found in PATH.
     echo         Please install WiX v3.14+ from https://wixtoolset.org

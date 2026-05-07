@@ -26,3 +26,12 @@ trayprint.log
 # OS files
 .DS_Store
 Thumbs.db
+
+# WiX / MSI build artifacts
+*.msi
+*.wixpdb
+*.wixobj
+*.wixout
+installer/TrayPrint-3.0.0.msi
+installer/TrayPrint-3.0.0.wixpdb
+installer/TrayPrint.wixobj

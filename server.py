@@ -22,7 +22,7 @@ import threading
 start_time = time.time()
 
 import printer
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 from logger import get_logger, get_log_path
 from log_utils import setup_logging as setup_log_utils, get_log_path as get_log_utils_path
 
@@ -110,7 +110,7 @@ class JobQueue:
 
     def __init__(self, db_name='jobs.db', max_history=50):
         self._lock = threading.Lock()
-        self.db_path = os.path.join(get_root_dir(), db_name)
+        self.db_path = os.path.join(get_data_dir(), db_name)
         self._max = max_history
         self._init_db()
 
@@ -226,7 +226,7 @@ class OfflineJobStore:
     """Thread-safe SQLite store for jobs that could not be reported to the hub."""
 
     def __init__(self, db_name='offline_jobs.db'):
-        self.db_path = os.path.join(get_root_dir(), db_name)
+        self.db_path = os.path.join(get_data_dir(), db_name)
         self._lock = threading.Lock()
         self._init_db()
 
@@ -407,7 +407,7 @@ def save_profiles_to_config(profiles):
     """Persist profiles back to config.json."""
     global _profiles
     _profiles = profiles
-    config_path = os.path.join(get_root_dir(), 'config.json')
+    config_path = os.path.join(get_data_dir(), 'config.json')
     try:
         with open(config_path, 'r') as f:
             data = json.load(f)

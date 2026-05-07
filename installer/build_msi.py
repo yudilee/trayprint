@@ -310,9 +310,9 @@ def main():
     has_wix = check_wix()
 
     print(f"Builder detection:")
-    print(f"  cx_Freeze:     {'✓' if has_cx else '✗'}")
-    print(f"  PyInstaller:   {'✓' if has_py else '✗'}")
-    print(f"  WiX Toolset:   {'✓' if has_wix else '✗'}")
+    print(f"  cx_Freeze:     {'YES' if has_cx else 'NO'}")
+    print(f"  PyInstaller:   {'YES' if has_py else 'NO'}")
+    print(f"  WiX Toolset:   {'YES' if has_wix else 'NO'}")
 
     builder = args.builder
     if builder == "auto":

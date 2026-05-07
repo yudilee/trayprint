@@ -2,7 +2,7 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/2006/util">
   <!--
-    TrayPrint — WiX Toolset v3.x Installer Definition
+    TrayPrint â€” WiX Toolset v3.x Installer Definition
 
     Build with:
       candle.exe -ext WixUtilExtension product.wxs
@@ -26,8 +26,8 @@
       Compressed="yes"
       InstallScope="perMachine"
       Platform="x64"
-      Description="TrayPrint – Local Print Agent for Print Hub"
-      Comments="TrayPrint v1.0.0 — Windows Print Agent"
+      Description="TrayPrint â€“ Local Print Agent for Print Hub"
+      Comments="TrayPrint v1.0.0 â€” Windows Print Agent"
       Manufacturer="Print Hub"
     />
 
@@ -135,7 +135,7 @@
     <!-- Icon reference -->
     <Icon Id="TrayPrintIcon" SourceFile="..\trayprint.ico" />
 
-    <!-- UI — use the standard WiX MSI dialog set -->
+    <!-- UI â€” use the standard WiX MSI dialog set -->
     <UIRef Id="WixUI_Minimal" />
 
     <!-- Allow upgrading from previous versions -->
@@ -145,12 +145,12 @@
     />
 
     <!--
-      ── Scheduled Task Custom Actions ──
+      â”€â”€ Scheduled Task Custom Actions â”€â”€
       Uses WixQuietExec (from WixUtilExtension) to run PowerShell scripts
       silently during install / uninstall with SYSTEM privileges.
     -->
 
-    <!-- Register Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <!-- Register Scheduled Task (deferred, no impersonation â€” runs as SYSTEM) -->
     <CustomAction
       Id="RegisterScheduledTask"
       BinaryKey="WixCA"
@@ -162,10 +162,10 @@
     <CustomAction
       Id="RegisterScheduledTask_SetProperty"
       Property="RegisterScheduledTask"
-      Value=""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File "[APPLICATIONFOLDER]Register-TrayPrintTask.ps1" -InstallPath "[APPLICATIONFOLDER]""
+      Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File [APPLICATIONFOLDER]Register-TrayPrintTask.ps1 -InstallPath [APPLICATIONFOLDER]"
     />
 
-    <!-- Unregister Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <!-- Unregister Scheduled Task (deferred, no impersonation â€” runs as SYSTEM) -->
     <CustomAction
       Id="UnregisterScheduledTask"
       BinaryKey="WixCA"
@@ -177,7 +177,7 @@
     <CustomAction
       Id="UnregisterScheduledTask_SetProperty"
       Property="UnregisterScheduledTask"
-      Value=""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File "[APPLICATIONFOLDER]Unregister-TrayPrintTask.ps1""
+      Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File [APPLICATIONFOLDER]Unregister-TrayPrintTask.ps1"
     />
 
     <!-- Custom action to run TrayPrint after installation -->
@@ -203,3 +203,6 @@
     </InstallExecuteSequence>
   </Product>
 </Wix>
+
+
+
