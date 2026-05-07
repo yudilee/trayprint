@@ -1,3 +1,12 @@
+"""
+TrayPrint — Flask API Server
+
+Provides a local REST API for printing, job queue management, printer discovery,
+and hub synchronization. Used by the TrayPrint tray application and Windows service.
+
+Logging is configured via log_utils with rotating file handler support.
+"""
+
 import json
 import os
 import sys
@@ -5,6 +14,7 @@ import uuid
 import time
 import subprocess
 import platform as _platform
+import tempfile
 from datetime import datetime
 from collections import OrderedDict
 import threading
@@ -14,8 +24,30 @@ start_time = time.time()
 import printer
 from path_utils import get_root_dir
 from logger import get_logger, get_log_path
+from log_utils import setup_logging as setup_log_utils, get_log_path as get_log_utils_path
 
-log = get_logger()
+# Initialize logging using log_utils (with config-based rotation settings)
+_config_for_logging = None
+try:
+    _config_path = os.path.join(get_root_dir(), "config.json")
+    if os.path.exists(_config_path):
+        with open(_config_path, "r") as f:
+            _config_for_logging = json.load(f)
+except Exception:
+    pass
+
+log = setup_log_utils(
+    name="trayprint",
+    config=_config_for_logging,
+)
+
+# Try to import psutil for memory/disk monitoring (optional)
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    log.info("psutil not available — memory/disk monitoring will use fallback methods")
 
 # ─────────────────────────────────────────────
 #  Printer Config Merge Support
@@ -184,8 +216,98 @@ class JobQueue:
                 conn.commit()
 
 
+# ─────────────────────────────────────────────
+#  Offline Job Store
+#  Buffers completed jobs locally when the hub is unreachable,
+#  and replays them once connectivity is restored.
+# ─────────────────────────────────────────────
+
+class OfflineJobStore:
+    """Thread-safe SQLite store for jobs that could not be reported to the hub."""
+
+    def __init__(self, db_name='offline_jobs.db'):
+        self.db_path = os.path.join(get_root_dir(), db_name)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS offline_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL,
+                        printer TEXT NOT NULL,
+                        job_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        error TEXT,
+                        options TEXT,
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT NOT NULL,
+                        stored_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        retry_count INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                conn.commit()
+
+    def store(self, job):
+        """Store a completed job for later sync to hub."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """INSERT INTO offline_jobs (job_id, printer, job_type, status, error, options, created_at, completed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job.get('id', job.get('job_id', '')),
+                        job.get('printer', ''),
+                        job.get('type', ''),
+                        job.get('status', ''),
+                        job.get('error'),
+                        json.dumps(job.get('options', {})),
+                        job.get('created_at', ''),
+                        job.get('completed_at', ''),
+                    )
+                )
+                conn.commit()
+
+    def list_pending(self):
+        """Return all unsynced jobs ordered by stored_at."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM offline_jobs ORDER BY stored_at ASC"
+                ).fetchall()
+                return [dict(r) for r in rows]
+
+    def mark_synced(self, job_id):
+        """Remove a job from the offline store after successful sync."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM offline_jobs WHERE job_id = ?", (job_id,))
+                conn.commit()
+
+    def increment_retry(self, job_id):
+        """Increment retry count for a failed sync attempt."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE offline_jobs SET retry_count = retry_count + 1 WHERE job_id = ?",
+                    (job_id,)
+                )
+                conn.commit()
+
+    def count(self):
+        """Return the number of pending offline jobs."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) as cnt FROM offline_jobs").fetchone()
+                return row[0] if row else 0
+
+
 # Global job queue
 _job_queue = JobQueue()
+_offline_store = OfflineJobStore()
 _notification_callback = None
 
 # ── Queue refresh request (for WebSocket-triggered immediate poll) ──
@@ -383,6 +505,12 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
                             log.info("Pulled job %s from hub.", j['job_id'])
                             _internal_print_queue.put(j)
                         jobs_found = len(jobs) > 0
+
+                        # Flush any offline-buffered jobs now that we're connected
+                        try:
+                            _flush_offline_jobs(hub_url, agent_key)
+                        except Exception as offline_e:
+                            log.debug("Offline job flush error: %s", offline_e)
 
                 # Slower polling for profiles and CORS
                 if profile_counter >= interval:
@@ -630,7 +758,11 @@ def report_status_to_hub(hub_url, agent_key):
         log.debug("Failed to report status to hub: %s", e)
 
 def report_job_to_hub(hub_url, agent_key, job):
-    """Report a completed job back to the central hub (fire-and-forget)."""
+    """Report a completed job back to the central hub (fire-and-forget).
+    
+    Falls back to the offline job store if the hub is unreachable.
+    Offline jobs are automatically replayed when connectivity is restored.
+    """
     import requests
 
     def _report():
@@ -651,10 +783,54 @@ def report_job_to_hub(hub_url, agent_key, job):
             if resp.status_code == 200:
                 json_data = resp.json()
                 _check_hub_response(json_data, "job report")
+            else:
+                # Non-200 response — buffer offline
+                log.warning("Hub returned %d for job report, buffering offline", resp.status_code)
+                _offline_store.store(job)
+        except requests.ConnectionError:
+            log.info("Hub unreachable — buffering job %s in offline store", job.get('id', '?'))
+            _offline_store.store(job)
         except Exception as e:
-            log.debug("Failed to report job to hub: %s", e)
+            log.debug("Failed to report job to hub: %s — buffering offline", e)
+            _offline_store.store(job)
 
     threading.Thread(target=_report, daemon=True).start()
+
+
+def _flush_offline_jobs(hub_url, agent_key):
+    """Replay buffered offline jobs to the hub. Called from sync loop when connected."""
+    import requests
+    pending = _offline_store.list_pending()
+    if not pending:
+        return
+
+    log.info("Flushing %d offline job(s) to hub", len(pending))
+    headers = {'Authorization': f'Bearer {agent_key}',
+               'Content-Type': 'application/json'}
+
+    for job in pending:
+        try:
+            payload = {
+                'job_id': job['job_id'],
+                'printer': job['printer'],
+                'type': job['job_type'],
+                'status': job['status'],
+                'error': job.get('error'),
+                'options': json.loads(job.get('options', '{}')),
+                'created_at': job['created_at'],
+                'completed_at': job['completed_at'],
+            }
+            resp = requests.post(f'{hub_url}/api/print-hub/jobs', json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                _offline_store.mark_synced(job['job_id'])
+                log.info("Offline job %s synced to hub", job['job_id'])
+            else:
+                _offline_store.increment_retry(job['job_id'])
+                log.warning("Failed to sync offline job %s (HTTP %d)", job['job_id'], resp.status_code)
+        except Exception as e:
+            _offline_store.increment_retry(job['job_id'])
+            log.debug("Failed to sync offline job %s: %s", job['job_id'], e)
+            break  # Stop trying on connection error — will retry next cycle
 
 
 # ─────────────────────────────────────────────
@@ -690,11 +866,70 @@ _watchdog_status = {
     "running": False,
     "last_check": None,
     "restart_attempts": 0,
+    "memory_usage": "N/A",
+    "disk_space": "N/A",
+    "websocket_status": "N/A",
 }
 _watchdog_status_lock = threading.Lock()
 
+# Watchdog ring buffer (last 50 check results)
+_watchdog_log = []
+_watchdog_log_lock = threading.Lock()
+WATCHDOG_LOG_MAX = 50
+
+# Watchdog checks configuration (loaded from config.json)
+_watchdog_checks_config = {
+    "spooler": True,
+    "memory": True,
+    "disk": True,
+    "websocket": True,
+}
+_watchdog_checks_lock = threading.Lock()
+
+
+def _add_watchdog_log_entry(message):
+    """Add an entry to the watchdog ring buffer."""
+    with _watchdog_log_lock:
+        _watchdog_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "message": message,
+        })
+        # Trim to max size
+        while len(_watchdog_log) > WATCHDOG_LOG_MAX:
+            _watchdog_log.pop(0)
+
+
+def get_watchdog_log():
+    """Return the watchdog log ring buffer."""
+    with _watchdog_log_lock:
+        return list(_watchdog_log)
+
+
+def load_watchdog_checks_config():
+    """Load watchdog_checks from config.json, falling back to defaults."""
+    config_path = os.path.join(get_root_dir(), 'config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            checks = data.get('watchdog_checks', {})
+            if checks:
+                with _watchdog_checks_lock:
+                    for key in _watchdog_checks_config:
+                        if key in checks:
+                            _watchdog_checks_config[key] = bool(checks[key])
+                log.info("Loaded watchdog checks config: %s", _watchdog_checks_config)
+    except Exception as e:
+        log.error("Error loading watchdog checks config: %s", e)
+
+
+def is_watchdog_check_enabled(check_name):
+    """Check if a specific watchdog check is enabled."""
+    with _watchdog_checks_lock:
+        return _watchdog_checks_config.get(check_name, True)
+
 class WatchdogThread(threading.Thread):
-    """Periodically checks if the print spooler is still running."""
+    """Periodically checks spooler health, memory usage, disk space, and WebSocket."""
 
     def __init__(self, check_interval=60):
         super().__init__(daemon=True)
@@ -709,6 +944,11 @@ class WatchdogThread(threading.Thread):
             _watchdog_status["running"] = True
             _watchdog_status["last_check"] = None
             _watchdog_status["restart_attempts"] = 0
+            _watchdog_status["memory_usage"] = "N/A"
+            _watchdog_status["disk_space"] = "N/A"
+            _watchdog_status["websocket_status"] = "N/A"
+
+        _add_watchdog_log_entry("Watchdog started (interval=%ds)" % self.check_interval)
 
         while not self._stop_event.is_set():
             self._perform_check()
@@ -716,6 +956,7 @@ class WatchdogThread(threading.Thread):
 
         with _watchdog_status_lock:
             _watchdog_status["running"] = False
+        _add_watchdog_log_entry("Watchdog stopped")
         log.info("Watchdog stopped")
 
     def stop(self):
@@ -754,15 +995,12 @@ class WatchdogThread(threading.Thread):
     def _check_macos_cups(self):
         """Check if CUPS is running on macOS via cupsctl or lpstat."""
         try:
-            # macOS: check via cupsctl or lpstat
             result = subprocess.run(
                 ['cupsctl'],
                 capture_output=True, text=True, timeout=10
             )
-            # cupsctl returns 0 if CUPS is running
             return result.returncode == 0
         except FileNotFoundError:
-            # Fallback to lpstat
             try:
                 result = subprocess.run(
                     ['lpstat', '-r'],
@@ -774,33 +1012,181 @@ class WatchdogThread(threading.Thread):
         except Exception:
             return True
 
-    def _perform_check(self):
-        """Check spooler health and attempt restart if needed."""
+    def _check_memory_usage(self):
+        """Check process memory usage via psutil or /proc/self/status."""
         try:
-            if _platform.system() == 'Windows':
-                alive = self._check_windows_spooler()
-            elif _platform.system() == 'Darwin':
-                alive = self._check_macos_cups()
+            if HAS_PSUTIL:
+                proc = psutil.Process(os.getpid())
+                mem_info = proc.memory_info()
+                rss_mb = mem_info.rss / (1024 * 1024)
+                vms_mb = mem_info.vms / (1024 * 1024)
+                mem_percent = proc.memory_percent()
+                result = f"RSS={rss_mb:.1f}MB, VMS={vms_mb:.1f}MB, {mem_percent:.1f}%"
+                with _watchdog_status_lock:
+                    _watchdog_status["memory_usage"] = result
+                return result
             else:
-                alive = self._check_linux_cups()
-
-            if not alive:
-                self._consecutive_failures += 1
-                log.warning("Watchdog: spooler check failed (%d/3)", self._consecutive_failures)
-                if self._consecutive_failures >= 3:
-                    log.warning("Watchdog: spooler appears dead, attempting restart...")
-                    self._attempt_restart()
-                    self._consecutive_failures = 0
-            else:
-                if self._consecutive_failures > 0:
-                    log.info("Watchdog: spooler recovered after %d failures", self._consecutive_failures)
-                self._consecutive_failures = 0
+                # Fallback: read /proc/self/status on Linux
+                if sys.platform == 'linux':
+                    with open('/proc/self/status', 'r') as f:
+                        for line in f:
+                            if line.startswith('VmRSS:'):
+                                rss = line.split()[1]
+                                result = f"RSS={rss}kB"
+                                with _watchdog_status_lock:
+                                    _watchdog_status["memory_usage"] = result
+                                return result
+                raise RuntimeError("No memory monitoring available")
         except Exception as e:
-            log.error("Watchdog check error: %s", e)
+            log.debug("Watchdog memory check failed: %s", e)
+            with _watchdog_status_lock:
+                _watchdog_status["memory_usage"] = "Error: %s" % str(e)
+            return "Error: %s" % str(e)
+
+    def _check_disk_space(self):
+        """Check that temp directory has sufficient free space (>100MB)."""
+        try:
+            temp_dir = tempfile.gettempdir()
+            if HAS_PSUTIL:
+                usage = psutil.disk_usage(temp_dir)
+                free_mb = usage.free / (1024 * 1024)
+                total_mb = usage.total / (1024 * 1024)
+                status = "OK" if free_mb > 100 else "LOW"
+                result = f"{status}: {free_mb:.0f}MB free of {total_mb:.0f}MB ({temp_dir})"
+            else:
+                # Fallback: use os.statvfs on Unix
+                if sys.platform != 'win32':
+                    st = os.statvfs(temp_dir)
+                    free_mb = (st.f_bavail * st.f_frsize) / (1024 * 1024)
+                else:
+                    # Windows fallback: use ctypes
+                    import ctypes
+                    free_bytes = ctypes.c_ulonglong(0)
+                    ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                        ctypes.c_wchar_p(temp_dir), None, None, ctypes.pointer(free_bytes)
+                    )
+                    free_mb = free_bytes.value / (1024 * 1024)
+                status = "OK" if free_mb > 100 else "LOW"
+                result = f"{status}: {free_mb:.0f}MB free ({temp_dir})"
+
+            with _watchdog_status_lock:
+                _watchdog_status["disk_space"] = result
+            return result
+        except Exception as e:
+            log.debug("Watchdog disk check failed: %s", e)
+            result = "Error: %s" % str(e)
+            with _watchdog_status_lock:
+                _watchdog_status["disk_space"] = result
+            return result
+
+    def _check_websocket_health(self):
+        """Check if WebSocket client is connected and responsive."""
+        try:
+            # Import websocket client module to check its status
+            import websocket_client as ws_mod
+            # The ws_client is stored in app.py's TrayApp, but we can check
+            # via the module-level reference if available
+            if hasattr(ws_mod, '_ws_client_instance') and ws_mod._ws_client_instance:
+                client = ws_mod._ws_client_instance
+                if client.is_connected:
+                    result = "Connected"
+                elif client.is_running:
+                    result = "Reconnecting"
+                else:
+                    result = "Disconnected"
+            else:
+                result = "Not configured"
+            with _watchdog_status_lock:
+                _watchdog_status["websocket_status"] = result
+            return result
+        except Exception as e:
+            log.debug("Watchdog WebSocket check failed: %s", e)
+            result = "Error: %s" % str(e)
+            with _watchdog_status_lock:
+                _watchdog_status["websocket_status"] = result
+            return result
+
+    def _perform_check(self):
+        """Run all enabled watchdog checks."""
+        check_time = datetime.now().isoformat()
+        results = []
+
+        # 1. Spooler health check
+        if is_watchdog_check_enabled("spooler"):
+            try:
+                if _platform.system() == 'Windows':
+                    alive = self._check_windows_spooler()
+                elif _platform.system() == 'Darwin':
+                    alive = self._check_macos_cups()
+                else:
+                    alive = self._check_linux_cups()
+
+                if not alive:
+                    self._consecutive_failures += 1
+                    msg = "Spooler check FAILED (%d/3)" % self._consecutive_failures
+                    results.append(msg)
+                    log.warning("Watchdog: %s", msg)
+                    if self._consecutive_failures >= 3:
+                        log.warning("Watchdog: spooler appears dead, attempting restart...")
+                        self._attempt_restart()
+                        self._consecutive_failures = 0
+                else:
+                    if self._consecutive_failures > 0:
+                        msg = "Spooler recovered after %d failures" % self._consecutive_failures
+                        results.append(msg)
+                        log.info("Watchdog: %s", msg)
+                    self._consecutive_failures = 0
+                    results.append("Spooler OK")
+            except Exception as e:
+                results.append("Spooler error: %s" % str(e))
+                log.error("Watchdog spooler check error: %s", e)
+        else:
+            results.append("Spooler check disabled")
+
+        # 2. Memory usage check
+        if is_watchdog_check_enabled("memory"):
+            try:
+                mem_result = self._check_memory_usage()
+                results.append("Memory: %s" % mem_result)
+            except Exception as e:
+                results.append("Memory error: %s" % str(e))
+        else:
+            results.append("Memory check disabled")
+
+        # 3. Disk space check
+        if is_watchdog_check_enabled("disk"):
+            try:
+                disk_result = self._check_disk_space()
+                results.append("Disk: %s" % disk_result)
+            except Exception as e:
+                results.append("Disk error: %s" % str(e))
+        else:
+            results.append("Disk check disabled")
+
+        # 4. WebSocket health check
+        if is_watchdog_check_enabled("websocket"):
+            try:
+                ws_result = self._check_websocket_health()
+                results.append("WebSocket: %s" % ws_result)
+            except Exception as e:
+                results.append("WebSocket error: %s" % str(e))
+        else:
+            results.append("WebSocket check disabled")
+
+        # Update last check time
+        with _watchdog_status_lock:
+            _watchdog_status["last_check"] = check_time
+
+        # Add combined result to log
+        summary = "; ".join(results)
+        _add_watchdog_log_entry("Check at %s: %s" % (check_time, summary))
 
     def _attempt_restart(self):
         """Try to restart the spooler service."""
         self._restart_attempts += 1
+        with _watchdog_status_lock:
+            _watchdog_status["restart_attempts"] = self._restart_attempts
+        _add_watchdog_log_entry("Attempting spooler restart (#%d)" % self._restart_attempts)
         try:
             if _platform.system() == 'Windows':
                 result = subprocess.run(
@@ -809,10 +1195,11 @@ class WatchdogThread(threading.Thread):
                 )
                 if result.returncode == 0:
                     log.info("Watchdog: spoolsv.exe restarted successfully")
+                    _add_watchdog_log_entry("spoolsv.exe restarted successfully")
                 else:
                     log.warning("Watchdog: failed to restart spoolsv.exe: %s", result.stderr)
+                    _add_watchdog_log_entry("Failed to restart spoolsv.exe: %s" % result.stderr)
             elif _platform.system() == 'Darwin':
-                # macOS: restart CUPS via launchctl
                 try:
                     result = subprocess.run(
                         ['sudo', 'launchctl', 'kickstart', '-k', 'system/org.cups.cupsd'],
@@ -825,10 +1212,11 @@ class WatchdogThread(threading.Thread):
                     )
                 if result.returncode == 0:
                     log.info("Watchdog: macOS CUPS restarted successfully")
+                    _add_watchdog_log_entry("macOS CUPS restarted successfully")
                 else:
                     log.warning("Watchdog: failed to restart macOS CUPS: %s", result.stderr)
+                    _add_watchdog_log_entry("Failed to restart macOS CUPS: %s" % result.stderr)
             else:
-                # Try systemctl first, then service fallback
                 try:
                     result = subprocess.run(
                         ['sudo', 'systemctl', 'start', 'cups'],
@@ -841,10 +1229,13 @@ class WatchdogThread(threading.Thread):
                     )
                 if result.returncode == 0:
                     log.info("Watchdog: CUPS restarted successfully")
+                    _add_watchdog_log_entry("CUPS restarted successfully")
                 else:
                     log.warning("Watchdog: failed to restart CUPS: %s", result.stderr)
+                    _add_watchdog_log_entry("Failed to restart CUPS: %s" % result.stderr)
         except Exception as e:
             log.error("Watchdog restart failed: %s", e)
+            _add_watchdog_log_entry("Restart failed: %s" % str(e))
 
 
 # ─────────────────────────────────────────────
@@ -867,6 +1258,7 @@ def reload_config():
             if 'allowed_origins' in data:
                 _allowed_origins = data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
             load_profiles_from_config()
+            load_watchdog_checks_config()
             log.info("Config reloaded: hub_url=%s, profiles=%d", _hub_url, len(_profiles))
             return True
     except Exception as e:
@@ -874,9 +1266,12 @@ def reload_config():
     return False
 
 def get_watchdog_status():
-    """Return the current watchdog status dict."""
+    """Return the current watchdog status dict including log entries."""
     with _watchdog_status_lock:
-        return dict(_watchdog_status)
+        status = dict(_watchdog_status)
+    status['log'] = get_watchdog_log()
+    status['checks_config'] = dict(_watchdog_checks_config)
+    return status
 
 
 # ─────────────────────────────────────────────
@@ -906,6 +1301,9 @@ def create_app():
 
     global _allowed_origins
     _allowed_origins = config_data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
+
+    # Load watchdog checks config
+    load_watchdog_checks_config()
 
     @app.before_request
     def handle_options():
@@ -1159,6 +1557,97 @@ def create_app():
 
         wd_status = get_watchdog_status()
 
+        # System info
+        import socket
+        system_info = {
+            "os_version": _platform.platform(),
+            "python_version": sys.version.split()[0],
+            "architecture": _platform.machine(),
+            "machine": _platform.machine(),
+            "processor": _platform.processor(),
+            "hostname": socket.gethostname(),
+        }
+
+        # Try to get PySide6 and PyMuPDF versions
+        pyside6_version = ""
+        pymupdf_version = ""
+        try:
+            from PySide6 import QtCore
+            pyside6_version = QtCore.__version__
+        except Exception:
+            pass
+        try:
+            import fitz
+            pymupdf_version = fitz.version
+        except Exception:
+            pass
+        system_info["pyside6_version"] = pyside6_version
+        system_info["pymupdf_version"] = pymupdf_version
+
+        # WebSocket status
+        websocket_status = {"connected": False, "reconnect_count": 0}
+        try:
+            import websocket_client as ws_mod
+            if hasattr(ws_mod, '_ws_instance') and ws_mod._ws_instance:
+                ws = ws_mod._ws_instance
+                websocket_status["connected"] = ws.connected if hasattr(ws, 'connected') else False
+                websocket_status["reconnect_count"] = ws.reconnect_count if hasattr(ws, 'reconnect_count') else 0
+                websocket_status["url"] = ws.url if hasattr(ws, 'url') else ""
+        except Exception:
+            pass
+
+        # Proxy config
+        proxy_config = {
+            "http_proxy": os.environ.get('HTTP_PROXY', '') or os.environ.get('http_proxy', ''),
+            "https_proxy": os.environ.get('HTTPS_PROXY', '') or os.environ.get('https_proxy', ''),
+            "no_proxy": os.environ.get('NO_PROXY', '') or os.environ.get('no_proxy', ''),
+        }
+
+        # Printer capabilities (all printers)
+        printer_capabilities = {}
+        try:
+            import capabilities as caps_mod
+            printer_capabilities = caps_mod.discover_all_printers_capabilities()
+        except Exception:
+            pass
+
+        # Default printer
+        default_printer = ""
+        try:
+            default_printer = printer.get_default_printer()
+        except Exception:
+            pass
+
+        # Jobs (full list, cleaned)
+        jobs = []
+        try:
+            raw_jobs = _job_queue.list_recent(50)
+            jobs = [{k: v for k, v in j.items() if not k.startswith('_')} for j in raw_jobs]
+        except Exception:
+            pass
+
+        # Logs (last 50 lines) — try log_utils path first, fall back to logger path
+        logs = []
+        try:
+            log_path = get_log_utils_path(name="trayprint")
+            if not log_path or not os.path.exists(log_path):
+                log_path = get_log_path()
+            if log_path and os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                    all_lines = f.readlines()
+                    logs = [line.rstrip('\n') for line in all_lines[-50:]]
+        except Exception:
+            pass
+
+        # Hub reachable and last sync time
+        hub_reachable = test_hub_connection()
+        last_sync_time = ""
+        try:
+            if hasattr(_hub_sync_thread, '_last_sync_time'):
+                last_sync_time = _hub_sync_thread._last_sync_time
+        except Exception:
+            pass
+
         return jsonify({
             "app_version": APP_VERSION,
             "python_version": sys.version,
@@ -1167,21 +1656,35 @@ def create_app():
             "config_path": config_path,
             "config_exists": config_exists,
             "hub_url": hub_url,
-            "hub_connected": test_hub_connection(),
+            "hub_connected": hub_reachable,
+            "hub_reachable": hub_reachable,
+            "last_sync_time": last_sync_time,
             "printer_count": len(printers_list),
             "printers": [p['name'] for p in printers_list],
             "queue_length": len(queue),
             "uptime": uptime_str,
             "log_file": get_log_path(),
             "os_details": _platform.platform(),
+            "system_info": system_info,
+            "websocket_status": websocket_status,
+            "proxy_config": proxy_config,
+            "printer_capabilities": printer_capabilities,
+            "default_printer": default_printer,
+            "jobs": jobs,
+            "logs": logs,
             "watchdog": wd_status,
         }), 200
 
-    # ── Watchdog Status ──
+    # ── Watchdog Status & Log ──
 
     @app.route('/api/watchdog/status', methods=['GET'])
     def watchdog_status_route():
         return jsonify(get_watchdog_status()), 200
+
+    @app.route('/api/watchdog/log', methods=['GET'])
+    def watchdog_log_route():
+        """Return the watchdog check history (ring buffer)."""
+        return jsonify({"log": get_watchdog_log()}), 200
 
     return app
 
@@ -1204,6 +1707,9 @@ def run_server(port):
         log.info("Initial printer check: found %d printer(s)", _cached_printer_count)
     except Exception:
         pass
+
+    # Load watchdog checks config before starting watchdog
+    load_watchdog_checks_config()
 
     # Start watchdog thread
     _watchdog_thread = WatchdogThread(check_interval=60)

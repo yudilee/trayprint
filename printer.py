@@ -3,6 +3,7 @@ import os
 import subprocess
 import platform
 import tempfile
+import re
 from logger import get_logger
 
 # Windows-specific imports
@@ -26,6 +27,74 @@ def is_windows():
 
 def is_macos():
     return sys.platform == 'darwin'
+
+
+# ─────────────────────────────────────────────
+#  macOS Paper Size Mapping
+# ─────────────────────────────────────────────
+
+MACOS_PAPER_MAP = {
+    # Standard ISO sizes
+    'A0': 'A0',
+    'A1': 'A1',
+    'A2': 'A2',
+    'A3': 'A3',
+    'A4': 'A4',
+    'A5': 'A5',
+    'A6': 'A6',
+    'B0': 'B0',
+    'B1': 'B1',
+    'B2': 'B2',
+    'B3': 'B3',
+    'B4': 'B4',
+    'B5': 'B5',
+    # North American sizes
+    'Letter': 'Letter',
+    'Legal': 'Legal',
+    'Tabloid': 'Tabloid',
+    'Ledger': 'Ledger',
+    'Executive': 'Executive',
+    'Statement': 'Statement',
+    'Folio': 'Folio',
+    # Envelope sizes
+    'C4': 'C4',
+    'C5': 'C5',
+    'C6': 'C6',
+    'DL': 'DL',
+    'Monarch': 'Monarch',
+    'Number 10': 'Number10',
+    'Number 9': 'Number9',
+    # Japanese
+    'B5 (JIS)': 'B5',
+    'B4 (JIS)': 'B4',
+    # Photo sizes
+    '4x6': '4x6',
+    '5x7': '5x7',
+    '8x10': '8x10',
+    # Custom / continuous
+    'Custom': 'Custom',
+}
+
+# macOS-specific paper name aliases (CUPS names → macOS driver names)
+MACOS_PAPER_ALIASES = {
+    'halfletter': 'Statement',
+    'half letter': 'Statement',
+    'Half Letter': 'Statement',
+    'F4': 'Folio',
+    'f4': 'Folio',
+    'A3': 'A3',
+    'A4': 'A4',
+    'A5': 'A5',
+    'B4': 'B4',
+    'B5': 'B5',
+    'letter': 'Letter',
+    'legal': 'Legal',
+    'tabloid': 'Tabloid',
+    'ledger': 'Ledger',
+    'executive': 'Executive',
+    'statement': 'Statement',
+    'folio': 'Folio',
+}
 
 
 def _get_sumatra_path():
@@ -124,8 +193,62 @@ def get_printers():
         try:
             import platform_darwin
             printers = platform_darwin.get_printers_macos()
+            log.info("macOS: found %d printer(s) via platform_darwin", len(printers))
         except Exception as e:
-            log.error("Error enumerating macOS printers: %s", e)
+            log.warning("platform_darwin printer enumeration failed: %s", e)
+            log.info("macOS: falling back to lpstat -a for printer discovery")
+
+        # If platform_darwin returned nothing, try lpstat directly
+        if not printers:
+            try:
+                result = subprocess.run(
+                    ['lpstat', '-a'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if line.strip():
+                            parts = line.split()
+                            if len(parts) > 0:
+                                name = parts[0]
+                                status = 'accepting' if 'accepting' in line.lower() else 'unknown'
+                                printers.append({
+                                    'name': name,
+                                    'is_default': (name == default_name),
+                                    'status': status,
+                                    'location': '',
+                                })
+                    log.info("macOS: found %d printer(s) via lpstat -a", len(printers))
+            except Exception as e2:
+                log.error("macOS lpstat -a failed: %s", e2)
+
+        # Try system_profiler for detailed printer info (macOS-specific)
+        if printers:
+            try:
+                sp_result = subprocess.run(
+                    ['system_profiler', 'SPPrintersDataType'],
+                    capture_output=True, text=True, timeout=30
+                )
+                if sp_result.returncode == 0:
+                    # Parse system_profiler output to enrich printer info
+                    current_name = None
+                    for line in sp_result.stdout.splitlines():
+                        line_stripped = line.strip()
+                        # Match: "Name: PrinterName"
+                        if line_stripped.startswith('Name:'):
+                            current_name = line_stripped.split(':', 1)[1].strip()
+                        elif line_stripped.startswith('Location:') and current_name:
+                            location = line_stripped.split(':', 1)[1].strip()
+                            for p in printers:
+                                if p['name'] == current_name:
+                                    p['location'] = location
+                                    break
+                            current_name = None
+                    log.info("macOS: enriched printer info via system_profiler")
+            except FileNotFoundError:
+                log.debug("macOS: system_profiler not available (non-macOS or restricted)")
+            except Exception as e3:
+                log.debug("macOS: system_profiler enrichment failed: %s", e3)
     else:
         try:
             result = subprocess.run(['lpstat', '-a'], capture_output=True, text=True, check=True)
@@ -295,7 +418,20 @@ def _build_lp_options(options):
         log.debug("CUPS: OutputOrder=reverse")
 
     # ─────────────────────────────────────────────
-    # 13. Finishing Options (Staple, Punch, Booklet, Fold)
+    # 13. Scaling Percentage
+    # ─────────────────────────────────────────────
+    scaling = options.get('scaling_percentage')
+    if scaling is not None:
+        try:
+            scaling_val = int(scaling)
+            if 1 <= scaling_val <= 1000:
+                args += ['-o', f'scaling={scaling_val}']
+                log.debug("CUPS: scaling=%d", scaling_val)
+        except (ValueError, TypeError):
+            log.warning("CUPS: invalid scaling_percentage value: %s", scaling)
+
+    # ─────────────────────────────────────────────
+    # 14. Finishing Options (Staple, Punch, Booklet, Fold)
     # ─────────────────────────────────────────────
     # Staple — IPP "finishings" collection
     staple = options.get('finishing_staple')
@@ -1024,6 +1160,49 @@ def _create_devmode_for_options(printer_name, options):
     return None, None
 
 
+def _parse_page_range(page_range_str):
+    """
+    Parse a page range string into a sorted list of 0-based page indices.
+
+    Supported formats:
+      - "1-5"       → [0, 1, 2, 3, 4]
+      - "1,3,5"     → [0, 2, 4]
+      - "1-5,7,9-11" → [0,1,2,3,4,6,8,9,10]
+      - None / ""   → None (all pages)
+    """
+    if not page_range_str:
+        return None
+    pages = set()
+    parts = str(page_range_str).split(',')
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                start_s, end_s = part.split('-', 1)
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+                if start < 1 or end < 1:
+                    log.warning("Invalid page range part '%s': page numbers must be >= 1", part)
+                    continue
+                pages.update(range(start - 1, end))  # Convert to 0-based
+            except (ValueError, TypeError):
+                log.warning("Invalid page range part '%s'", part)
+        else:
+            try:
+                p = int(part)
+                if p < 1:
+                    log.warning("Invalid page number '%s': must be >= 1", part)
+                    continue
+                pages.add(p - 1)  # Convert to 0-based
+            except (ValueError, TypeError):
+                log.warning("Invalid page number '%s'", part)
+    if not pages:
+        return None
+    return sorted(pages)
+
+
 def _print_pdf_windows(printer_name, pdf_path, options):
     """
     Print a PDF directly via Windows GDI + PyMuPDF — no SumatraPDF.
@@ -1034,6 +1213,12 @@ def _print_pdf_windows(printer_name, pdf_path, options):
       3. Create a printer DC (which inherits the default DevMode we just set)
       4. PyMuPDF renders each page at printer DPI → BitBlt onto DC
       5. Restore original printer default
+
+    Supports:
+      - Page range (page_range option: "1-5", "1,3,5", "1-5,7,9-11")
+      - Copies (copies option)
+      - Collate (collate option)
+      - GDI mode selection via gdi_mode option
     """
     try:
         import fitz  # PyMuPDF
@@ -1042,6 +1227,9 @@ def _print_pdf_windows(printer_name, pdf_path, options):
         import win32con
         from PIL import Image
         import io
+
+        log.info("GDI print (PyMuPDF): printer=%s, path=%s, options=%s",
+                 printer_name, pdf_path, options)
 
         devmode, paper_name = _create_devmode_for_options(printer_name, options)
         log.info("GDI print: printer=%s paper=%s", printer_name, paper_name)
@@ -1077,149 +1265,56 @@ def _print_pdf_windows(printer_name, pdf_path, options):
 
                 # ── Step 3: Render PDF with PyMuPDF ──
                 doc = fitz.open(pdf_path)
-                copies = max(1, int(options.get('copies', 1)) if options else 1)
+                total_pages = len(doc)
+                log.info("GDI: opened PDF with %d pages", total_pages)
+
+                # ── Parse page range ──
+                page_range_str = (options or {}).get('page_range')
+                selected_pages = _parse_page_range(page_range_str)
+                if selected_pages is not None:
+                    # Filter to valid page numbers within document range
+                    valid_pages = [p for p in selected_pages if 0 <= p < total_pages]
+                    log.info("GDI: page_range='%s' → %d selected pages (out of %d)",
+                             page_range_str, len(valid_pages), total_pages)
+                    if not valid_pages:
+                        log.warning("GDI: page_range '%s' yielded no valid pages, printing all", page_range_str)
+                        valid_pages = list(range(total_pages))
+                else:
+                    valid_pages = list(range(total_pages))
+                    log.info("GDI: no page_range, printing all %d pages", total_pages)
+
+                # ── Copies and collate ──
+                copies = max(1, int((options or {}).get('copies', 1)))
+                collate = (options or {}).get('collate', False)
+                log.info("GDI: copies=%d, collate=%s, pages_to_print=%d",
+                         copies, collate, len(valid_pages))
 
                 dc.StartDoc('PrintHub Job')
 
-                total_pages = len(doc)
-                for copy_idx in range(copies):
-                    for page_num in range(total_pages):
-                        page = doc[page_num]
-
-                        # ── Margins: convert mm → pixels ──
-                        mm_to_px_x = dpi_x / 25.4
-                        mm_to_px_y = dpi_y / 25.4
-                        margin_l = int((options.get('margin_left',   0) or 0) * mm_to_px_x) if options else 0
-                        margin_r = int((options.get('margin_right',  0) or 0) * mm_to_px_x) if options else 0
-                        margin_t = int((options.get('margin_top',    0) or 0) * mm_to_px_y) if options else 0
-                        margin_b = int((options.get('margin_bottom', 0) or 0) * mm_to_px_y) if options else 0
-                        avail_w = max((pwidth_px  - 2 * offset_x) - margin_l - margin_r, 1)
-                        avail_h = max((pheight_px - 2 * offset_y) - margin_t - margin_b, 1)
-
-                        # ── Render at 720dpi (2x oversampling for sharper text) ──
-                        # Higher render DPI = more pixels = finer text detail.
-                        # StretchDIBits with HALFTONE mode averages them smoothly.
-                        RENDER_DPI = 720
-                        mat = fitz.Matrix(RENDER_DPI / 72.0, RENDER_DPI / 72.0)
-                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-
-                        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                        img_w, img_h = img.size
-                        log.info("Copy %d Page %d: rendered %dx%d @ %ddpi, DC=%dx%d dpi, avail=%dx%d px",
-                                 copy_idx + 1, page_num + 1, img_w, img_h, RENDER_DPI,
-                                 dpi_x, dpi_y, avail_w, avail_h)
-
-                        # ── Orientation: rotate page to match DC shape ──
-                        # Compare rendered PDF shape against the printer DC shape.
-                        # If they already match (both landscape or both portrait), do nothing.
-                        # Only rotate if they differ.
-                        dc_is_landscape   = pwidth_px > pheight_px
-                        page_is_landscape = img_w > img_h
-                        if dc_is_landscape and not page_is_landscape:
-                            img = img.rotate(-90, expand=True)
-                            img_w, img_h = img.size
-                            log.info("Rotated CW 90° (DC=landscape, page=portrait)")
-                        elif not dc_is_landscape and page_is_landscape:
-                            img = img.rotate(90, expand=True)
-                            img_w, img_h = img.size
-                            log.info("Rotated CCW 90° (DC=portrait, page=landscape)")
-                        else:
-                            log.info("No rotation (DC=%s, page=%s)",
-                                     'landscape' if dc_is_landscape else 'portrait',
-                                     'landscape' if page_is_landscape else 'portrait')
-
-                        # ── Send via StretchDIBits ──
-                        # dst size = avail_w × avail_h (full printable area minus margins)
-                        # src size = rendered image size
-                        # GDI stretches/shrinks to fill correctly for ANY DPI configuration.
-                        import ctypes
-
-                        # Convert RGB → BGR (Windows GDI 24-bit expects BGR)
-                        r, g, b = img.split()
-                        img_bgr = Image.merge('RGB', (b, g, r))
-
-                        # Build DWORD-aligned pixel buffer
-                        row_bytes = img_w * 3
-                        pad_bytes = (4 - (row_bytes % 4)) % 4
-                        raw_rgb   = img_bgr.tobytes()
-                        if pad_bytes:
-                            padded  = bytearray()
-                            padding = b'\x00' * pad_bytes
-                            for row in range(img_h):
-                                padded += raw_rgb[row * row_bytes:(row + 1) * row_bytes]
-                                padded += padding
-                            pixel_data = ctypes.create_string_buffer(bytes(padded))
-                        else:
-                            pixel_data = ctypes.create_string_buffer(raw_rgb)
-                        stride = row_bytes + pad_bytes
-
-                        # BITMAPINFOHEADER
-                        class BITMAPINFOHEADER(ctypes.Structure):
-                            _fields_ = [
-                                ('biSize',          ctypes.c_uint32),
-                                ('biWidth',         ctypes.c_int32),
-                                ('biHeight',        ctypes.c_int32),
-                                ('biPlanes',        ctypes.c_uint16),
-                                ('biBitCount',      ctypes.c_uint16),
-                                ('biCompression',   ctypes.c_uint32),
-                                ('biSizeImage',     ctypes.c_uint32),
-                                ('biXPelsPerMeter', ctypes.c_int32),
-                                ('biYPelsPerMeter', ctypes.c_int32),
-                                ('biClrUsed',       ctypes.c_uint32),
-                                ('biClrImportant',  ctypes.c_uint32),
-                            ]
-
-                        bmi = BITMAPINFOHEADER()
-                        bmi.biSize          = ctypes.sizeof(BITMAPINFOHEADER)
-                        bmi.biWidth         = img_w
-                        bmi.biHeight        = -img_h
-                        bmi.biPlanes        = 1
-                        bmi.biBitCount      = 24
-                        bmi.biCompression   = 0
-                        bmi.biSizeImage     = stride * img_h
-                        bmi.biXPelsPerMeter = int(RENDER_DPI / 0.0254)
-                        bmi.biYPelsPerMeter = int(RENDER_DPI / 0.0254)
-                        bmi.biClrUsed       = 0
-                        bmi.biClrImportant  = 0
-
-                        gdi32 = ctypes.windll.gdi32
-                        gdi32.StretchDIBits.argtypes = [
-                            ctypes.c_void_p,
-                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                            ctypes.c_void_p, ctypes.c_void_p,
-                            ctypes.c_uint, ctypes.c_ulong,
-                        ]
-                        gdi32.StretchDIBits.restype = ctypes.c_int
-
-                        hdc = dc.GetSafeHdc()
-
-                        # HALFTONE mode: Windows averages pixels when scaling
-                        # (default STRETCH_DELETESCANS discards rows — very poor for text)
-                        # SetBrushOrgEx is required after setting HALFTONE per Windows API.
-                        HALFTONE = 4
-                        gdi32.SetStretchBltMode(hdc, HALFTONE)
-                        gdi32.SetBrushOrgEx(hdc, 0, 0, None)
-
-                        dc.StartPage()
-                        result = gdi32.StretchDIBits(
-                            hdc,
-                            margin_l, margin_t, avail_w, avail_h,  # dst: fill available area
-                            0, 0, img_w, img_h,                     # src: full rendered image
-                            pixel_data,
-                            ctypes.byref(bmi),
-                            0,          # DIB_RGB_COLORS
-                            0x00CC0020, # SRCCOPY
-                        )
-                        dc.EndPage()
-                        log.info("StretchDIBits: %dx%d src → %dx%d dst, result=%s",
-                                 img_w, img_h, avail_w, avail_h, result)
-
-
+                if collate:
+                    # Collated: print all pages for copy 1, then all pages for copy 2, etc.
+                    for copy_idx in range(copies):
+                        log.info("GDI: collated copy %d/%d", copy_idx + 1, copies)
+                        for page_num in valid_pages:
+                            _render_and_print_page(
+                                dc, doc, page_num, options,
+                                pwidth_px, pheight_px, dpi_x, dpi_y,
+                                offset_x, offset_y, copy_idx, copies
+                            )
+                else:
+                    # Non-collated: print all copies of page 1, then all copies of page 2, etc.
+                    for page_num in valid_pages:
+                        for copy_idx in range(copies):
+                            _render_and_print_page(
+                                dc, doc, page_num, options,
+                                pwidth_px, pheight_px, dpi_x, dpi_y,
+                                offset_x, offset_y, copy_idx, copies
+                            )
 
                 dc.EndDoc()
                 doc.close()
-                log.info("GDI print complete: %d page(s) x %d copy(ies)", total_pages, copies)
+                log.info("GDI print complete: %d page(s) x %d copy(ies), collate=%s",
+                         len(valid_pages), copies, collate)
                 return True, ""
 
             finally:
@@ -1242,6 +1337,136 @@ def _print_pdf_windows(printer_name, pdf_path, options):
         log.error("GDI print failed: %s", e, exc_info=True)
         log.info("Falling back to SumatraPDF...")
         return _print_pdf_sumatra(printer_name, pdf_path, options)
+
+
+def _render_and_print_page(dc, doc, page_num, options,
+                           pwidth_px, pheight_px, dpi_x, dpi_y,
+                           offset_x, offset_y, copy_idx, total_copies):
+    """
+    Render a single PDF page and send it to the printer DC via StretchDIBits.
+    Extracted as a helper to avoid code duplication in collated/non-collated loops.
+    """
+    import ctypes
+    from PIL import Image
+
+    page = doc[page_num]
+
+    # ── Margins: convert mm → pixels ──
+    mm_to_px_x = dpi_x / 25.4
+    mm_to_px_y = dpi_y / 25.4
+    margin_l = int((options.get('margin_left',   0) or 0) * mm_to_px_x) if options else 0
+    margin_r = int((options.get('margin_right',  0) or 0) * mm_to_px_x) if options else 0
+    margin_t = int((options.get('margin_top',    0) or 0) * mm_to_px_y) if options else 0
+    margin_b = int((options.get('margin_bottom', 0) or 0) * mm_to_px_y) if options else 0
+    avail_w = max((pwidth_px  - 2 * offset_x) - margin_l - margin_r, 1)
+    avail_h = max((pheight_px - 2 * offset_y) - margin_t - margin_b, 1)
+
+    # ── Render at 720dpi (2x oversampling for sharper text) ──
+    RENDER_DPI = 720
+    import fitz
+    mat = fitz.Matrix(RENDER_DPI / 72.0, RENDER_DPI / 72.0)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img_w, img_h = img.size
+    log.info("Copy %d/%d Page %d: rendered %dx%d @ %ddpi, DC=%dx%d dpi, avail=%dx%d px",
+             copy_idx + 1, total_copies, page_num + 1, img_w, img_h, RENDER_DPI,
+             dpi_x, dpi_y, avail_w, avail_h)
+
+    # ── Orientation: rotate page to match DC shape ──
+    dc_is_landscape   = pwidth_px > pheight_px
+    page_is_landscape = img_w > img_h
+    if dc_is_landscape and not page_is_landscape:
+        img = img.rotate(-90, expand=True)
+        img_w, img_h = img.size
+        log.info("Rotated CW 90° (DC=landscape, page=portrait)")
+    elif not dc_is_landscape and page_is_landscape:
+        img = img.rotate(90, expand=True)
+        img_w, img_h = img.size
+        log.info("Rotated CCW 90° (DC=portrait, page=landscape)")
+    else:
+        log.info("No rotation (DC=%s, page=%s)",
+                 'landscape' if dc_is_landscape else 'portrait',
+                 'landscape' if page_is_landscape else 'portrait')
+
+    # ── Send via StretchDIBits ──
+    # Convert RGB → BGR (Windows GDI 24-bit expects BGR)
+    r, g, b = img.split()
+    img_bgr = Image.merge('RGB', (b, g, r))
+
+    # Build DWORD-aligned pixel buffer
+    row_bytes = img_w * 3
+    pad_bytes = (4 - (row_bytes % 4)) % 4
+    raw_rgb   = img_bgr.tobytes()
+    if pad_bytes:
+        padded  = bytearray()
+        padding = b'\x00' * pad_bytes
+        for row in range(img_h):
+            padded += raw_rgb[row * row_bytes:(row + 1) * row_bytes]
+            padded += padding
+        pixel_data = ctypes.create_string_buffer(bytes(padded))
+    else:
+        pixel_data = ctypes.create_string_buffer(raw_rgb)
+    stride = row_bytes + pad_bytes
+
+    # BITMAPINFOHEADER
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ('biSize',          ctypes.c_uint32),
+            ('biWidth',         ctypes.c_int32),
+            ('biHeight',        ctypes.c_int32),
+            ('biPlanes',        ctypes.c_uint16),
+            ('biBitCount',      ctypes.c_uint16),
+            ('biCompression',   ctypes.c_uint32),
+            ('biSizeImage',     ctypes.c_uint32),
+            ('biXPelsPerMeter', ctypes.c_int32),
+            ('biYPelsPerMeter', ctypes.c_int32),
+            ('biClrUsed',       ctypes.c_uint32),
+            ('biClrImportant',  ctypes.c_uint32),
+        ]
+
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize          = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth         = img_w
+    bmi.biHeight        = -img_h
+    bmi.biPlanes        = 1
+    bmi.biBitCount      = 24
+    bmi.biCompression   = 0
+    bmi.biSizeImage     = stride * img_h
+    bmi.biXPelsPerMeter = int(RENDER_DPI / 0.0254)
+    bmi.biYPelsPerMeter = int(RENDER_DPI / 0.0254)
+    bmi.biClrUsed       = 0
+    bmi.biClrImportant  = 0
+
+    gdi32 = ctypes.windll.gdi32
+    gdi32.StretchDIBits.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint, ctypes.c_ulong,
+    ]
+    gdi32.StretchDIBits.restype = ctypes.c_int
+
+    hdc = dc.GetSafeHdc()
+
+    HALFTONE = 4
+    gdi32.SetStretchBltMode(hdc, HALFTONE)
+    gdi32.SetBrushOrgEx(hdc, 0, 0, None)
+
+    dc.StartPage()
+    result = gdi32.StretchDIBits(
+        hdc,
+        margin_l, margin_t, avail_w, avail_h,
+        0, 0, img_w, img_h,
+        pixel_data,
+        ctypes.byref(bmi),
+        0,          # DIB_RGB_COLORS
+        0x00CC0020, # SRCCOPY
+    )
+    dc.EndPage()
+    log.info("StretchDIBits page %d: %dx%d src → %dx%d dst, result=%s",
+             page_num + 1, img_w, img_h, avail_w, avail_h, result)
 
 
 def _print_pdf_sumatra(printer_name, pdf_path, options):
@@ -1288,6 +1513,221 @@ def _print_pdf_sumatra(printer_name, pdf_path, options):
         return False, str(e)
 
 
+# ─────────────────────────────────────────────
+#  macOS PDF Printing
+# ─────────────────────────────────────────────
+
+def _build_macos_lp_options(options):
+    """
+    Converts an options dict into lp command-line flags for macOS CUPS.
+    Includes macOS-specific paper name handling and color management.
+    """
+    args = []
+    if not options:
+        return args
+
+    # 1. Copies
+    copies = options.get('copies')
+    if copies and int(copies) > 1:
+        args += ['-n', str(int(copies))]
+
+    # 2. Paper Size — map to macOS-compatible names
+    paper = options.get('paper_size')
+    width_mm = options.get('paper_width_mm')
+    height_mm = options.get('paper_height_mm')
+
+    if width_mm and height_mm:
+        # Custom size
+        args += ['-o', f'media=Custom.{width_mm}x{height_mm}mm']
+        log.debug("macOS: custom media=Custom.%sx%smm", width_mm, height_mm)
+    elif paper:
+        # Map paper name through macOS aliases
+        mapped = MACOS_PAPER_ALIASES.get(paper, paper)
+        args += ['-o', f'media={mapped}']
+        log.debug("macOS: media=%s (original=%s)", mapped, paper)
+
+    # 3. Orientation
+    orientation = options.get('orientation')
+    if orientation == 'landscape':
+        args += ['-o', 'orientation-requested=4']
+    else:
+        args += ['-o', 'orientation-requested=3']
+
+    # 4. Margins (mm → points: 1mm = 2.83465 pts)
+    m_top = options.get('margin_top', 0)
+    m_bottom = options.get('margin_bottom', 0)
+    m_left = options.get('margin_left', 0)
+    m_right = options.get('margin_right', 0)
+    if any([m_top, m_bottom, m_left, m_right]):
+        args += [
+            '-o', f'page-top={int(float(m_top) * 2.83465)}',
+            '-o', f'page-bottom={int(float(m_bottom) * 2.83465)}',
+            '-o', f'page-left={int(float(m_left) * 2.83465)}',
+            '-o', f'page-right={int(float(m_right) * 2.83465)}',
+        ]
+
+    # 5. Fit to Page
+    if options.get('fit_to_page') or any([m_top, m_bottom, m_left, m_right]):
+        args += ['-o', 'fit-to-page']
+
+    # 6. Duplex
+    duplex = options.get('duplex')
+    if duplex == 'two-sided-long':
+        args += ['-o', 'sides=two-sided-long-edge']
+    elif duplex == 'two-sided-short':
+        args += ['-o', 'sides=two-sided-short-edge']
+
+    # 7. Page Range
+    page_range = options.get('page_range')
+    if page_range:
+        args += ['-o', f'page-ranges={page_range}']
+
+    # 8. Tray Source (InputSlot)
+    tray_source = options.get('tray_source')
+    if tray_source:
+        args += ['-o', f'InputSlot={tray_source}']
+        log.debug("macOS: InputSlot=%s", tray_source)
+
+    # 9. Color Mode — macOS-specific ColorModel values
+    color_mode = options.get('color_mode')
+    if color_mode == 'monochrome':
+        args += ['-o', 'ColorModel=Gray']
+        log.debug("macOS: ColorModel=Gray")
+    elif color_mode == 'color':
+        args += ['-o', 'ColorModel=RGB']
+        log.debug("macOS: ColorModel=RGB")
+
+    # 10. Print Quality (IPP values)
+    quality_map = {'draft': '3', 'normal': '4', 'high': '5'}
+    print_quality = options.get('print_quality')
+    if print_quality and print_quality in quality_map:
+        args += ['-o', f'print-quality={quality_map[print_quality]}']
+        log.debug("macOS: print-quality=%s", quality_map[print_quality])
+
+    # 11. Media Type
+    media_type = options.get('media_type')
+    if media_type:
+        args += ['-o', f'media-type={media_type}']
+        log.debug("macOS: media-type=%s", media_type)
+
+    # 12. Collate
+    collate = options.get('collate')
+    if collate is not None:
+        args += ['-o', f'Collate={str(collate).lower()}']
+        log.debug("macOS: Collate=%s", str(collate).lower())
+
+    # 13. Reverse Order
+    reverse_order = options.get('reverse_order')
+    if reverse_order:
+        args += ['-o', 'OutputOrder=reverse']
+        log.debug("macOS: OutputOrder=reverse")
+
+    # 14. Scaling Percentage
+    scaling = options.get('scaling_percentage')
+    if scaling is not None:
+        try:
+            scaling_val = int(scaling)
+            if 1 <= scaling_val <= 1000:
+                args += ['-o', f'scaling={scaling_val}']
+                log.debug("macOS: scaling=%d", scaling_val)
+        except (ValueError, TypeError):
+            log.warning("macOS: invalid scaling_percentage value: %s", scaling)
+
+    # 15. Finishing Options (Staple, Punch, Booklet, Fold)
+    staple = options.get('finishing_staple')
+    if staple:
+        if staple == 'single':
+            args += ['-o', 'StapleLocation=SinglePortrait']
+        elif staple == 'dual':
+            args += ['-o', 'StapleLocation=DualPortrait']
+        elif staple == 'saddle':
+            args += ['-o', 'StapleLocation=SaddleStitch']
+        log.debug("macOS: StapleLocation=%s", staple)
+
+    punch = options.get('finishing_punch')
+    if punch:
+        args += ['-o', f'Punch={punch}']
+        log.debug("macOS: Punch=%s", punch)
+
+    booklet = options.get('finishing_booklet')
+    if booklet:
+        args += ['-o', 'number-up=2', '-o', 'page-set=all']
+        log.debug("macOS: booklet mode (number-up=2)")
+
+    fold = options.get('finishing_fold')
+    if fold:
+        if fold == 'half':
+            args += ['-o', 'Fold=Half']
+        elif fold == 'tri-fold':
+            args += ['-o', 'Fold=TriFold']
+        elif fold == 'z-fold':
+            args += ['-o', 'Fold=ZFold']
+        log.debug("macOS: Fold=%s", fold)
+
+    return args
+
+
+def _print_pdf_macos(printer_name, pdf_path, options):
+    """
+    Print a PDF on macOS using CUPS/lp with macOS-specific options.
+    Falls back to 'open' command (Preview.app) if lp is unavailable.
+    """
+    log.info("macOS PDF print: printer=%s, path=%s, options=%s",
+             printer_name, pdf_path, options)
+
+    # Determine temp directory — macOS uses $TMPDIR which points to
+    # a per-user temp dir under /var/folders/...
+    macos_temp = os.environ.get('TMPDIR', '/tmp')
+    log.debug("macOS: using TMPDIR=%s", macos_temp)
+
+    # ── Strategy 1: Use lp (CUPS) ──
+    try:
+        # Check if lp is available
+        subprocess.run(['which', 'lp'], capture_output=True, check=True)
+
+        cmd = ['lp', '-d', printer_name]
+        cmd += _build_macos_lp_options(options)
+        cmd.append(pdf_path)
+
+        log.info("macOS lp cmd: %s", ' '.join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode == 0:
+            log.info("macOS lp print succeeded: %s", result.stdout.strip())
+            return True, ""
+        else:
+            error_msg = result.stderr.strip() if result.stderr else f"lp returned {result.returncode}"
+            log.warning("macOS lp failed: %s", error_msg)
+            # Fall through to 'open' fallback
+
+    except FileNotFoundError:
+        log.warning("macOS: lp command not found — CUPS may not be installed")
+    except subprocess.TimeoutExpired:
+        log.warning("macOS: lp timed out after 120s")
+    except Exception as e:
+        log.warning("macOS: lp exception: %s", e)
+
+    # ── Strategy 2: Fallback to 'open' command (opens in Preview.app) ──
+    try:
+        log.info("macOS: falling back to 'open' command (Preview.app)")
+        cmd = ['open', pdf_path]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+        log.info("macOS: opened PDF in Preview.app via 'open' command")
+        return True, ""
+    except FileNotFoundError:
+        error_msg = "Neither 'lp' nor 'open' commands found on macOS"
+        log.error(error_msg)
+        return False, error_msg
+    except subprocess.TimeoutExpired:
+        error_msg = "'open' command timed out"
+        log.error(error_msg)
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"macOS fallback failed: {e}"
+        log.error(error_msg)
+        return False, error_msg
+
+
 def print_pdf(printer_name, pdf_base64, options=None):
     """Decodes a base64 PDF and prints it silently using OS handlers."""
     import base64
@@ -1309,14 +1749,16 @@ def print_pdf(printer_name, pdf_base64, options=None):
             f.write(pdf_bytes)
 
         if is_windows():
-            success, error_msg = _print_pdf_windows(printer_name, temp_path, options)
+            # Check for GDI mode selection
+            gdi_mode = (options or {}).get('gdi_mode', 'pymupdf')
+            log.info("GDI mode selected: %s", gdi_mode)
+            if gdi_mode == 'sumatra':
+                log.info("Using SumatraPDF mode (gdi_mode=sumatra)")
+                success, error_msg = _print_pdf_sumatra(printer_name, temp_path, options)
+            else:
+                success, error_msg = _print_pdf_windows(printer_name, temp_path, options)
         elif is_macos():
-            try:
-                import platform_darwin
-                success, error_msg = platform_darwin.print_file_macos(printer_name, temp_path, options)
-            except Exception as e:
-                error_msg = str(e)
-                log.error("macOS PDF Print Error: %s", error_msg)
+            success, error_msg = _print_pdf_macos(printer_name, temp_path, options)
         else:
             try:
                 cmd = ['lp', '-d', printer_name]

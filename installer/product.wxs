@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/2006/util">
   <!--
     TrayPrint — WiX Toolset v3.x Installer Definition
 
     Build with:
-      candle.exe product.wxs
-      light.exe -out TrayPrint.msi product.wixobj
+      candle.exe -ext WixUtilExtension product.wxs
+      light.exe -ext WixUtilExtension -out TrayPrint.msi product.wixobj
 
     Prerequisites:
       - WiX Toolset v3.14 or later (https://wixtoolset.org)
@@ -68,6 +69,26 @@
               KeyPath="yes"
             />
           </Component>
+
+          <!-- PowerShell script: Register Scheduled Task -->
+          <Component Id="C_RegisterTaskScript" Guid="F6A7B8C9-D0E1-2345-6789-ABCDEF012345" Win64="yes">
+            <File
+              Id="F_RegisterTaskScript"
+              Name="Register-TrayPrintTask.ps1"
+              Source="Register-TrayPrintTask.ps1"
+              KeyPath="yes"
+            />
+          </Component>
+
+          <!-- PowerShell script: Unregister Scheduled Task -->
+          <Component Id="C_UnregisterTaskScript" Guid="A7B8C9D0-E1F2-3456-789A-BCDEF0123456" Win64="yes">
+            <File
+              Id="F_UnregisterTaskScript"
+              Name="Unregister-TrayPrintTask.ps1"
+              Source="Unregister-TrayPrintTask.ps1"
+              KeyPath="yes"
+            />
+          </Component>
         </Directory>
       </Directory>
 
@@ -107,22 +128,9 @@
       <ComponentRef Id="C_TrayPrintExe" />
       <ComponentRef Id="C_ConfigJson" />
       <ComponentRef Id="C_DesktopShortcut" />
-      <ComponentRef Id="C_AutoStartRegistry" />
+      <ComponentRef Id="C_RegisterTaskScript" />
+      <ComponentRef Id="C_UnregisterTaskScript" />
     </Feature>
-
-    <!-- Auto-start via HKCU\Software\Microsoft\Windows\CurrentVersion\Run -->
-    <DirectoryRef Id="APPLICATIONFOLDER">
-      <Component Id="C_AutoStartRegistry" Guid="E5F6A7B8-C9D0-1234-EF12-345678901234" Win64="yes">
-        <RegistryValue
-          Root="HKCU"
-          Key="Software\Microsoft\Windows\CurrentVersion\Run"
-          Name="TrayPrint"
-          Type="string"
-          Value="[APPLICATIONFOLDER]trayprint.exe"
-          KeyPath="yes"
-        />
-      </Component>
-    </DirectoryRef>
 
     <!-- Icon reference -->
     <Icon Id="TrayPrintIcon" SourceFile="..\trayprint.ico" />
@@ -136,6 +144,42 @@
       Schedule="afterInstallValidate"
     />
 
+    <!--
+      ── Scheduled Task Custom Actions ──
+      Uses WixQuietExec (from WixUtilExtension) to run PowerShell scripts
+      silently during install / uninstall with SYSTEM privileges.
+    -->
+
+    <!-- Register Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <CustomAction
+      Id="RegisterScheduledTask"
+      BinaryKey="WixCA"
+      JScriptCall="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore"
+    />
+    <CustomAction
+      Id="RegisterScheduledTask_SetProperty"
+      Property="RegisterScheduledTask"
+      Value=""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File "[APPLICATIONFOLDER]Register-TrayPrintTask.ps1" -InstallPath "[APPLICATIONFOLDER]""
+    />
+
+    <!-- Unregister Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <CustomAction
+      Id="UnregisterScheduledTask"
+      BinaryKey="WixCA"
+      JScriptCall="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore"
+    />
+    <CustomAction
+      Id="UnregisterScheduledTask_SetProperty"
+      Property="UnregisterScheduledTask"
+      Value=""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File "[APPLICATIONFOLDER]Unregister-TrayPrintTask.ps1""
+    />
+
     <!-- Custom action to run TrayPrint after installation -->
     <CustomAction
       Id="LaunchApplication"
@@ -146,6 +190,15 @@
     />
 
     <InstallExecuteSequence>
+      <!-- Schedule task registration AFTER files are installed -->
+      <Custom Action="RegisterScheduledTask_SetProperty" After="InstallFiles">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="RegisterScheduledTask" After="RegisterScheduledTask_SetProperty">NOT Installed AND NOT REMOVE</Custom>
+
+      <!-- Schedule task unregistration BEFORE files are removed -->
+      <Custom Action="UnregisterScheduledTask_SetProperty" After="InstallInitialize">REMOVE</Custom>
+      <Custom Action="UnregisterScheduledTask" After="UnregisterScheduledTask_SetProperty">REMOVE</Custom>
+
+      <!-- Launch application after install completes -->
       <Custom Action="LaunchApplication" After="InstallFinalize">NOT Installed</Custom>
     </InstallExecuteSequence>
   </Product>

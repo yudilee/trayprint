@@ -1,62 +1,85 @@
 # TrayPrint — MSI Installer Builder
 
-This directory contains WiX Toolset v3.x source files to build a Windows MSI
-installer for TrayPrint.
+This directory contains everything needed to build a Windows MSI installer for
+TrayPrint. The installer packages the TrayPrint tray application into a
+standard Windows Installer package with Start Menu shortcuts, auto-start
+registration, desktop shortcut, and uninstaller support.
 
 ## Prerequisites
 
-1. **WiX Toolset v3.14+**  
-   Download from: https://wixtoolset.org  
-   Ensure `candle.exe` and `light.exe` are in your `PATH`, or set the
-   `WIX_TOOLSET_PATH` environment variable to the WiX bin directory.
+### Option A: cx_Freeze (Recommended)
 
-2. **PyInstaller Build**  
-   Run `python build.py` from the project root **before** building the MSI.
-   The installer expects `dist\trayprint.exe` to exist.
+1. Install cx_Freeze:
+   ```cmd
+   pip install cx_Freeze
+   ```
 
-3. **Icon File**  
-   Place a `trayprint.ico` file in the project root for the installer icon and
-   shortcuts. This is optional but recommended.
+2. Run the build script:
+   ```cmd
+   python installer\build_msi.py
+   ```
 
-## Build
+### Option B: PyInstaller + WiX Toolset
 
-### Using `build_msi.bat` (Windows)
+1. **PyInstaller** — Install via pip:
+   ```cmd
+   pip install pyinstaller
+   ```
 
-Open a **Command Prompt** (cmd) and run:
+2. **WiX Toolset v3.14+** — Download from https://wixtoolset.org
+   - Ensure `candle.exe` and `light.exe` are in your `PATH`, or set the
+     `WIX` environment variable to the WiX bin directory.
 
-```cmd
-cd installer
-build_msi.bat
+3. **Icon File** — Place a `trayprint.ico` file in the project root.
+
+4. **Configuration** — Ensure `config.json` exists in the project root.
+
+5. Run the build script:
+   ```cmd
+   python installer\build_msi.py --builder pyinstaller
+   ```
+
+## Build Script Usage
+
+```
+python installer\build_msi.py [options]
+
+Options:
+  --builder {cx_freeze,pyinstaller,auto}
+                        Build backend (default: auto-detect)
+  --version VERSION     Installer version (default: 3.0.0)
+  --output-dir DIR      Output directory (default: installer/dist/)
+  --clean               Clean build artifacts before building
 ```
 
-The script will:
-
-1. Locate WiX candle.exe and light.exe (via `PATH` or `WIX_TOOLSET_PATH`).
-2. Verify that `dist\trayprint.exe` exists.
-3. Compile `product.wxs` → `product.wixobj`.
-4. Link `product.wixobj` → `TrayPrint.msi`.
-
-The resulting MSI is written to the `installer\` directory.
-
-### Manual Build
-
-If the batch script does not suit your environment:
+### Examples
 
 ```cmd
-candle.exe product.wxs
-light.exe -out TrayPrint.msi product.wixobj
+:: Auto-detect and build
+python installer\build_msi.py
+
+:: Build with specific version
+python installer\build_msi.py --version 3.1.0
+
+:: Force PyInstaller + WiX
+python installer\build_msi.py --builder pyinstaller
+
+:: Clean and rebuild
+python installer\build_msi.py --clean
 ```
 
 ## What the Installer Does
 
-| Component          | Description                                                    |
-|--------------------|----------------------------------------------------------------|
-| `trayprint.exe`    | Installed to `%ProgramFiles%\TrayPrint\`                       |
-| `config.json`      | Installed alongside the executable                             |
-| Start Menu Shortcut | Added under "TrayPrint" in the Start Menu                      |
-| Desktop Shortcut   | Created for quick launch                                        |
-| Auto-start         | Registers `HKCU\...\Run` so TrayPrint starts on Windows login  |
-| Major Upgrade      | Installs over previous versions automatically (uninstalls old) |
+| Component            | Description                                                       |
+|----------------------|-------------------------------------------------------------------|
+| Install Directory    | `%ProgramFiles%\PrintHub\TrayPrint\`                              |
+| `trayprint.exe`      | Main application executable                                       |
+| `config.json`        | Configuration file (installed alongside executable)               |
+| Start Menu Shortcut  | Added under "PrintHub" in the Start Menu                          |
+| Desktop Shortcut     | Created for quick launch (optional)                               |
+| Auto-start           | Registers `HKCU\...\Run` so TrayPrint starts on Windows login     |
+| Uninstaller          | Registered with Windows Installer — uninstall via Settings        |
+| Major Upgrade        | Automatically upgrades previous versions                          |
 
 ## Uninstall
 
@@ -65,11 +88,21 @@ The MSI registers itself with Windows Installer. Uninstall through:
 - **Settings → Apps → Apps & features → TrayPrint**
 - Or run the MSI again and choose **Remove**.
 
+## Manual WiX Build
+
+If you prefer to build manually with WiX:
+
+```cmd
+cd installer
+candle.exe -dVersion=3.0.0 trayprint.wxs
+light.exe -out TrayPrint-3.0.0.msi trayprint.wixobj
+```
+
 ## Customization
 
-Edit `product.wxs` to change:
+Edit `trayprint.wxs` to change:
 
-- **Version**: Update the `Version` attribute in `<Product>`.
-- **UpgradeCode**: Change the `UpgradeCode` GUID for a different product family.
-- **Start Menu name**: Modify the `Name` attribute in the Start Menu `<Directory>`.
-- **Install path**: Change `APPLICATIONFOLDER` under `ProgramFiles64Folder`.
+- **Version**: Pass via `-dVersion=X.Y.Z` to candle.exe, or use `--version`
+- **UpgradeCode**: Change the GUID for a different product family
+- **Install path**: Modify the `PrintHub\TrayPrint` directory structure
+- **Auto-start flags**: Change the `--silent` flag in the auto-start registry value

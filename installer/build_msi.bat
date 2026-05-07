@@ -14,6 +14,9 @@ REM         python build.py
 REM       Ensure dist\trayprint.exe exists.
 REM    3. trayprint.ico must exist in the project root.
 REM    4. config.json must exist in the project root.
+REM    5. PowerShell scripts must exist in the installer directory:
+REM         - Register-TrayPrintTask.ps1
+REM         - Unregister-TrayPrintTask.ps1
 REM
 REM ============================================================================
 
@@ -54,6 +57,18 @@ if not exist "%PROJECT_DIR%config.json" (
     echo           A default config.json will be expected by the installer.
 )
 
+if not exist "%SCRIPT_DIR%Register-TrayPrintTask.ps1" (
+    echo [ERROR] Register-TrayPrintTask.ps1 not found in installer directory.
+    echo         This script is required to register the Scheduled Task.
+    exit /b 1
+)
+
+if not exist "%SCRIPT_DIR%Unregister-TrayPrintTask.ps1" (
+    echo [ERROR] Unregister-TrayPrintTask.ps1 not found in installer directory.
+    echo         This script is required to unregister the Scheduled Task.
+    exit /b 1
+)
+
 REM ---- Build MSI ----
 echo ===========================================================================
 echo  TrayPrint — MSI Installer Build
@@ -65,7 +80,7 @@ echo.
 pushd "%SCRIPT_DIR%"
 
 echo [1/2] Compiling WiX source...
-%CANDLE% product.wxs -out product.wixobj
+%CANDLE% -ext WixUtilExtension product.wxs -out product.wixobj
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] WiX compilation failed (candle.exe exit code %ERRORLEVEL%).
     popd
@@ -73,7 +88,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [2/2] Linking MSI package...
-%LIGHT% -out "TrayPrint.msi" product.wixobj
+%LIGHT% -ext WixUtilExtension -out "TrayPrint.msi" product.wixobj
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] WiX linking failed (light.exe exit code %ERRORLEVEL%).
     popd

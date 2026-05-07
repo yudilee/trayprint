@@ -1,3 +1,25 @@
+"""
+TrayPrint — Main Application Entry Point
+
+Supports command-line arguments and environment variables for unattended
+/ silent deployment scenarios.
+
+Command-line arguments:
+    --config-path PATH     Specify config file location
+    --hub-url URL          Set hub URL on first run
+    --agent-key KEY        Set agent key on first run
+    --silent               Run without showing UI (for service mode)
+    --install-service      Install as Windows service (using nssm)
+    --uninstall-service    Remove Windows service
+    --version              Print version and exit
+
+Environment variables:
+    TRAYPRINT_HUB_URL       Override hub URL
+    TRAYPRINT_AGENT_KEY     Override agent key
+    TRAYPRINT_CONFIG_PATH   Override config file path
+"""
+
+import argparse
 import threading
 import os
 import sys
@@ -8,7 +30,7 @@ from datetime import datetime
 
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
-from PySide6.QtCore import Qt, QTimer, QCoreApplication
+from PySide6.QtCore import Qt, QTimer, QCoreApplication, QSharedMemory
 
 import server
 import websocket_client
@@ -16,12 +38,427 @@ import autostart
 import ui_settings
 from path_utils import get_root_dir
 from logger import get_logger, get_log_path
+from log_utils import setup_logging as setup_log_utils
 from notification_history import NotificationHistory, NotificationHistoryDialog
 from queue_dialog import PrintQueueDialog
 from diagnostics_dialog import DiagnosticsDialog
 from updater import UpdateChecker
 
-log = get_logger()
+# ── Version ──
+APP_VERSION = getattr(server, "APP_VERSION", "3.0.0")
+
+# ── CLI Argument Parser ──
+
+def build_arg_parser():
+    """Build and return the argument parser for CLI flags."""
+    parser = argparse.ArgumentParser(
+        description="TrayPrint — Local Print Agent for Print Hub",
+        add_help=False,  # We handle --help ourselves to avoid conflicts
+    )
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        default=None,
+        help="Specify config file location",
+    )
+    parser.add_argument(
+        "--hub-url",
+        type=str,
+        default=None,
+        help="Set hub URL on first run",
+    )
+    parser.add_argument(
+        "--agent-key",
+        type=str,
+        default=None,
+        help="Set agent key on first run",
+    )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        default=False,
+        help="Run without showing UI (for service mode)",
+    )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        default=False,
+        help="Install as Windows service (using nssm)",
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        default=False,
+        help="Remove Windows service",
+    )
+    parser.add_argument(
+        "--install-task",
+        action="store_true",
+        default=False,
+        help="Register a Scheduled Task to auto-start TrayPrint at system boot (admin)",
+    )
+    parser.add_argument(
+        "--uninstall-task",
+        action="store_true",
+        default=False,
+        help="Remove the TrayPrint Scheduled Task",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        default=False,
+        help="Print version and exit",
+    )
+    parser.add_argument(
+        "--help",
+        action="store_true",
+        default=False,
+        help="Show this help message and exit",
+    )
+    return parser
+
+
+def parse_cli_args():
+    """
+    Parse command-line arguments, filtering out PySide6/Qt arguments.
+    Returns a namespace with parsed args.
+    """
+    parser = build_arg_parser()
+
+    # Filter out Qt-specific arguments (e.g., -style, -platform)
+    qt_args = {"-style", "-platform", "-stylesheet", "-qmljsdebugger",
+               "-session", "-graphicssystem", "-native"}
+    filtered_argv = [sys.argv[0]]
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in qt_args:
+            i += 2  # Skip the argument and its value
+            continue
+        if arg.startswith("--") and "=" not in arg:
+            # Check if next arg is a value (not a flag)
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                # Check if this is a known argument that takes a value
+                known_with_value = {"--config-path", "--hub-url", "--agent-key"}
+                if arg in known_with_value:
+                    filtered_argv.append(arg)
+                    filtered_argv.append(sys.argv[i + 1])
+                    i += 2
+                    continue
+        filtered_argv.append(arg)
+        i += 1
+
+    args, _ = parser.parse_known_args(filtered_argv)
+    return args
+
+
+# ── Environment Variable Helpers ──
+
+def apply_env_overrides(config):
+    """
+    Apply environment variable overrides to the config dict.
+    Environment variables take precedence over config.json values.
+
+    Supported variables:
+        TRAYPRINT_HUB_URL       → config['hub_url']
+        TRAYPRINT_AGENT_KEY     → config['agent_key']
+        TRAYPRINT_CONFIG_PATH   → (used to locate config file)
+    """
+    env_hub = os.environ.get("TRAYPRINT_HUB_URL")
+    env_key = os.environ.get("TRAYPRINT_AGENT_KEY")
+    env_config = os.environ.get("TRAYPRINT_CONFIG_PATH")
+
+    if env_hub:
+        config["hub_url"] = env_hub
+    if env_key:
+        config["agent_key"] = env_key
+    if env_config:
+        config["_config_path_override"] = env_config
+
+    return config
+
+
+def apply_cli_overrides(config, args):
+    """
+    Apply CLI argument overrides to the config dict.
+    CLI arguments take precedence over both config.json and env vars.
+    """
+    if args.hub_url:
+        config["hub_url"] = args.hub_url
+    if args.agent_key:
+        config["agent_key"] = args.agent_key
+    if args.config_path:
+        config["_config_path_override"] = args.config_path
+
+    return config
+
+
+# ── Service Installation Helpers ──
+
+def install_windows_service():
+    """Install TrayPrint as a Windows service using nssm."""
+    if sys.platform != "win32":
+        print("[ERROR] Service installation is only supported on Windows.")
+        return False
+
+    nssm_path = _find_nssm()
+    if not nssm_path:
+        print("[ERROR] nssm.exe not found. Download from https://nssm.cc")
+        print("        Place nssm.exe in the application directory or in PATH.")
+        return False
+
+    service_name = "TrayPrint"
+    app_path = os.path.abspath(sys.argv[0])
+    config_path = os.path.join(get_root_dir(), "config.json")
+
+    try:
+        # Install the service
+        subprocess.run(
+            [
+                nssm_path, "install", service_name,
+                "Application", app_path,
+                "AppParameters", "--silent",
+                "AppDirectory", get_root_dir(),
+                "DisplayName", "TrayPrint Print Agent Service",
+                "Description",
+                "Local print agent service for Print Hub. "
+                "Provides a REST API for printing.",
+                "Start", "SERVICE_AUTO_START",
+                "AppStdout", os.path.join(get_root_dir(), "logs", "service.log"),
+                "AppStderr", os.path.join(get_root_dir(), "logs", "service.err"),
+            ],
+            check=True,
+        )
+        print(f"[SUCCESS] Service '{service_name}' installed.")
+        print(f"         Start with: nssm start {service_name}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Failed to install service: {e}")
+        return False
+    except FileNotFoundError:
+        print("[ERROR] nssm.exe not found in PATH.")
+        return False
+
+
+def uninstall_windows_service():
+    """Remove the TrayPrint Windows service."""
+    if sys.platform != "win32":
+        print("[ERROR] Service uninstallation is only supported on Windows.")
+        return False
+
+    nssm_path = _find_nssm()
+    if not nssm_path:
+        print("[ERROR] nssm.exe not found.")
+        return False
+
+    service_name = "TrayPrint"
+
+    try:
+        subprocess.run(
+            [nssm_path, "remove", service_name, "confirm"],
+            check=True,
+        )
+        print(f"[SUCCESS] Service '{service_name}' removed.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Failed to remove service: {e}")
+        return False
+
+
+def _find_nssm():
+    """Locate nssm.exe in PATH or application directory."""
+    # Check PATH
+    try:
+        result = subprocess.run(
+            ["where", "nssm.exe"] if sys.platform == "win32" else ["which", "nssm"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            path = result.stdout.strip().split("\n")[0]
+            if os.path.isfile(path):
+                return path
+    except Exception:
+        pass
+
+    # Check application directory
+    local_path = os.path.join(get_root_dir(), "nssm.exe")
+    if os.path.isfile(local_path):
+        return local_path
+
+    return None
+
+
+# ── Scheduled Task Helpers ──
+
+
+def _find_powershell():
+    """Locate PowerShell executable on Windows."""
+    if sys.platform != "win32":
+        return None
+    # Common PowerShell paths
+    candidates = [
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    # Fallback: try PATH
+    try:
+        result = subprocess.run(
+            ["where", "powershell.exe"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            path = result.stdout.strip().split("\n")[0]
+            if os.path.isfile(path):
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def _get_script_path(script_name):
+    """Resolve the full path to a PowerShell script in the installer directory."""
+    # When running from PyInstaller bundle, scripts are alongside the exe
+    exe_dir = os.path.dirname(sys.executable)
+    candidate = os.path.join(exe_dir, "installer", script_name)
+    if os.path.isfile(candidate):
+        return candidate
+    # When running from source
+    script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "installer")
+    candidate = os.path.join(script_dir, script_name)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def install_scheduled_task():
+    """Register a Scheduled Task to auto-start TrayPrint at system boot.
+
+    Delegates to Register-TrayPrintTask.ps1 which creates a task running
+    as NT AUTHORITY\SYSTEM with AtStartup trigger and restart-on-failure.
+    """
+    if sys.platform != "win32":
+        print("[ERROR] Scheduled Task installation is only supported on Windows.")
+        return False
+
+    powershell = _find_powershell()
+    if not powershell:
+        print("[ERROR] PowerShell not found. Cannot register Scheduled Task.")
+        return False
+
+    script_path = _get_script_path("Register-TrayPrintTask.ps1")
+    if not script_path:
+        print("[ERROR] Register-TrayPrintTask.ps1 not found.")
+        print("       Ensure the script is in the 'installer' directory.")
+        return False
+
+    # Determine the trayprint.exe path
+    exe_path = sys.executable
+    install_dir = os.path.dirname(exe_path)
+
+    try:
+        log.info("Registering Scheduled Task via %s", script_path)
+        result = subprocess.run(
+            [
+                powershell,
+                "-ExecutionPolicy", "Bypass",
+                "-File", script_path,
+                "-InstallPath", install_dir,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            print("[SUCCESS] Scheduled Task 'TrayPrintAgent' registered.")
+            print("         TrayPrint will auto-start at system boot as SYSTEM.")
+            if result.stdout.strip():
+                print(result.stdout.strip())
+            return True
+        else:
+            print(f"[ERROR] Failed to register Scheduled Task (exit code {result.returncode}).")
+            if result.stderr.strip():
+                print(f"       {result.stderr.strip()}")
+            return False
+    except subprocess.TimeoutExpired:
+        print("[ERROR] PowerShell script timed out after 30 seconds.")
+        return False
+    except FileNotFoundError as e:
+        print(f"[ERROR] PowerShell executable not found: {e}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Unexpected error: {e}")
+        return False
+
+
+def uninstall_scheduled_task():
+    """Remove the TrayPrint Scheduled Task.
+
+    Delegates to Unregister-TrayPrintTask.ps1 which removes the task
+    from Windows Task Scheduler.
+    """
+    if sys.platform != "win32":
+        print("[ERROR] Scheduled Task uninstallation is only supported on Windows.")
+        return False
+
+    powershell = _find_powershell()
+    if not powershell:
+        print("[ERROR] PowerShell not found. Cannot unregister Scheduled Task.")
+        return False
+
+    script_path = _get_script_path("Unregister-TrayPrintTask.ps1")
+    if not script_path:
+        print("[ERROR] Unregister-TrayPrintTask.ps1 not found.")
+        print("       Ensure the script is in the 'installer' directory.")
+        return False
+
+    try:
+        log.info("Unregistering Scheduled Task via %s", script_path)
+        result = subprocess.run(
+            [
+                powershell,
+                "-ExecutionPolicy", "Bypass",
+                "-File", script_path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            print("[SUCCESS] Scheduled Task 'TrayPrintAgent' removed.")
+            if result.stdout.strip():
+                print(result.stdout.strip())
+            return True
+        else:
+            print(f"[ERROR] Failed to unregister Scheduled Task (exit code {result.returncode}).")
+            if result.stderr.strip():
+                print(f"       {result.stderr.strip()}")
+            return False
+    except subprocess.TimeoutExpired:
+        print("[ERROR] PowerShell script timed out after 30 seconds.")
+        return False
+    except FileNotFoundError as e:
+        print(f"[ERROR] PowerShell executable not found: {e}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Unexpected error: {e}")
+        return False
+
+
+# ── Logger Setup ──
+
+# Initialize logging using log_utils (with config-based rotation settings)
+_config_for_logging = None
+try:
+    config_path = os.path.join(get_root_dir(), "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            _config_for_logging = json.load(f)
+except Exception:
+    pass
+
+log = setup_log_utils(
+    name="trayprint",
+    config=_config_for_logging,
+)
 
 # ─────────────────────────────────────────────
 #  Config Validation
@@ -88,15 +525,43 @@ def create_tray_icon(printing=False):
 #  Config
 # ─────────────────────────────────────────────
 
-def get_config():
-    config_path = os.path.join(get_root_dir(), 'config.json')
+def get_config(config_path_override=None):
+    """
+    Load configuration from config.json, with optional path override.
+
+    Parameters
+    ----------
+    config_path_override : str or None
+        If provided, use this path instead of the default config.json.
+
+    Returns
+    -------
+    dict
+        Configuration dictionary.
+    """
+    if config_path_override:
+        config_path = config_path_override
+    else:
+        # Check for env var override
+        env_config = os.environ.get("TRAYPRINT_CONFIG_PATH")
+        if env_config:
+            config_path = env_config
+        else:
+            config_path = os.path.join(get_root_dir(), 'config.json')
+
     config_data = {"port": 49211}
     try:
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 config_data.update(json.load(f))
+        else:
+            log.warning("Config file not found: %s", config_path)
     except Exception as e:
-        log.error("Error loading config: %s", e)
+        log.error("Error loading config from %s: %s", config_path, e)
+
+    # Apply environment variable overrides
+    config_data = apply_env_overrides(config_data)
+
     return config_data
 
 
@@ -104,8 +569,38 @@ def get_config():
 #  App Class
 # ─────────────────────────────────────────────
 
+# ── Single-Instance Guard ──
+INSTANCE_LOCK_KEY = "TrayPrint_SingleInstance_v3"
+
+
+def _check_instance_lock():
+    """Try to acquire a QSharedMemory lock; return False if another instance is running."""
+    shared_mem = QSharedMemory(INSTANCE_LOCK_KEY)
+
+    # Attach to an existing segment — if it exists, another instance is running
+    if shared_mem.attach():
+        log.warning("Another TrayPrint instance is already running (shared memory key exists)")
+        shared_mem.detach()
+        return False
+
+    # Try to create a new segment — if it fails, another instance beat us to it
+    if not shared_mem.create(1):
+        log.warning("Another TrayPrint instance is already running (create failed)")
+        return False
+
+    # Store reference so it stays alive for the process lifetime
+    _check_instance_lock._shared_mem = shared_mem
+    log.info("Single-instance lock acquired (%s)", INSTANCE_LOCK_KEY)
+    return True
+
+
 class TrayApp:
     def __init__(self, port):
+        # ── Single-instance guard ──
+        if not _check_instance_lock():
+            log.critical("TrayPrint is already running — exiting.")
+            sys.exit(1)
+
         self.port = port
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
@@ -537,13 +1032,160 @@ class TrayApp:
             log.info("WebSocket client not started (will use polling fallback)")
 
 
+# ─────────────────────────────────────────────
+#  Crash Diagnostics Handler
+#  Captures unhandled exceptions, writes a crash dump,
+#  and attempts to upload it to the hub for diagnostics.
+# ─────────────────────────────────────────────
+
+CRASH_LOG_PATH = os.path.join(get_root_dir(), "crash_diagnostics.log")
+
+
+def _crash_handler(exc_type, exc_value, exc_traceback):
+    """Global exception hook — writes crash dump and attempts hub upload."""
+    import traceback
+    from datetime import datetime
+
+    # Skip KeyboardInterrupt and SystemExit
+    if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    # Build crash report
+    tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    crash_report = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": APP_VERSION,
+        "platform": sys.platform,
+        "python_version": sys.version,
+        "exception_type": exc_type.__name__,
+        "exception_message": str(exc_value),
+        "traceback": "".join(tb_lines),
+    }
+
+    # Write to local crash log
+    try:
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"CRASH at {crash_report['timestamp']}\n")
+            f.write(f"Version: {crash_report['version']}\n")
+            f.write(f"Platform: {crash_report['platform']}\n")
+            f.write(f"Python: {crash_report['python_version']}\n")
+            f.write(f"Exception: {crash_report['exception_type']}: {crash_report['exception_message']}\n")
+            f.write("Traceback:\n")
+            f.write(crash_report['traceback'])
+            f.write("\n")
+    except Exception:
+        pass  # Don't crash while handling a crash
+
+    # Attempt to upload crash report to hub (fire-and-forget)
+    try:
+        config = get_config()
+        hub_url = config.get("hub_url", "")
+        agent_key = config.get("agent_key", "")
+        if hub_url and agent_key:
+            import requests
+            headers = {
+                'Authorization': f'Bearer {agent_key}',
+                'Content-Type': 'application/json',
+            }
+            payload = {
+                'event': 'crash.diagnostics',
+                'agent_version': crash_report['version'],
+                'platform': crash_report['platform'],
+                'exception': crash_report['exception_type'],
+                'message': crash_report['exception_message'],
+                'traceback': crash_report['traceback'],
+                'timestamp': crash_report['timestamp'],
+            }
+            threading.Thread(
+                target=lambda: requests.post(
+                    f'{hub_url}/api/print-hub/diagnostics/crash',
+                    json=payload,
+                    headers=headers,
+                    timeout=5,
+                ),
+                daemon=True,
+            ).start()
+    except Exception:
+        pass
+
+    # Log to logger as well
+    try:
+        log.critical(
+            "Unhandled %s: %s\n%s",
+            crash_report['exception_type'],
+            crash_report['exception_message'],
+            crash_report['traceback'],
+        )
+    except Exception:
+        pass
+
+    # Call the original excepthook to preserve default behavior
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
 def setup_tray(port, config=None):
     app = TrayApp(port)
     sys.exit(app.run())
 
 
-if __name__ == '__main__':
-    config = get_config()
+def main():
+    """Main entry point with CLI argument and environment variable support."""
+    args = parse_cli_args()
+
+    # ── Handle --version ──
+    if args.version:
+        print(f"TrayPrint v{APP_VERSION}")
+        print(f"Python: {sys.version}")
+        print(f"Platform: {sys.platform}")
+        sys.exit(0)
+
+    # ── Handle --help ──
+    if args.help:
+        parser = build_arg_parser()
+        parser.print_help()
+        print()
+        print("Environment variables:")
+        print("  TRAYPRINT_HUB_URL       Override hub URL")
+        print("  TRAYPRINT_AGENT_KEY     Override agent key")
+        print("  TRAYPRINT_CONFIG_PATH   Override config file path")
+        print()
+        print("Examples:")
+        print("  python app.py --hub-url https://hub.example.com --agent-key mykey")
+        print("  python app.py --silent")
+        print("  python app.py --install-service")
+        print("  python app.py --install-task")
+        print("  python app.py --uninstall-task")
+        print("  python app.py --version")
+        sys.exit(0)
+
+    # ── Handle --install-service ──
+    if args.install_service:
+        success = install_windows_service()
+        sys.exit(0 if success else 1)
+
+    # ── Handle --uninstall-service ──
+    if args.uninstall_service:
+        success = uninstall_windows_service()
+        sys.exit(0 if success else 1)
+
+    # ── Handle --install-task ──
+    if args.install_task:
+        success = install_scheduled_task()
+        sys.exit(0 if success else 1)
+
+    # ── Handle --uninstall-task ──
+    if args.uninstall_task:
+        success = uninstall_scheduled_task()
+        sys.exit(0 if success else 1)
+
+    # ── Load config with overrides ──
+    config_path = args.config_path or os.environ.get("TRAYPRINT_CONFIG_PATH")
+    config = get_config(config_path_override=config_path)
+
+    # Apply CLI overrides (highest precedence)
+    config = apply_cli_overrides(config, args)
 
     # Validate configuration on startup
     config_errors = validate_config(config)
@@ -551,4 +1193,43 @@ if __name__ == '__main__':
         for err in config_errors:
             log.warning("Config validation: %s", err)
 
+    # ── Handle --silent (no tray UI) ──
+    if args.silent:
+        log.info("Starting in silent mode (no tray UI)")
+        port = config.get("port", 49211)
+
+        # Start Flask server directly
+        server_thread = threading.Thread(
+            target=server.run_server,
+            args=(port,),
+            daemon=True,
+        )
+        server_thread.start()
+
+        # Start hub sync if configured
+        hub_url = config.get("hub_url", "")
+        agent_key = config.get("agent_key", "")
+        if hub_url and agent_key:
+            interval = config.get("sync_interval_seconds", 60)
+            max_retries = config.get("max_retries", 3)
+            retry_delay = config.get("retry_delay_seconds", 60)
+            server.start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
+
+        log.info("Silent mode active — server running on port %d", port)
+
+        # Keep the main thread alive
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            log.info("Shutting down (Ctrl+C)")
+        sys.exit(0)
+
+    # ── Normal mode (with tray UI) ──
     setup_tray(config.get('port', 49211), config)
+
+
+# Install global crash handler before anything else
+sys.excepthook = _crash_handler
+
+if __name__ == '__main__':
+    main()
