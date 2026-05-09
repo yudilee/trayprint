@@ -468,6 +468,8 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
     import requests
     import base64
 
+    hub_url = hub_url.rstrip('/')
+
     def sync_loop():
         profile_counter = interval  # Trigger immediately
         status_counter = interval   # Trigger immediately
@@ -475,6 +477,7 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
         max_backoff = 60
 
         while True:
+            jobs_found = False
             try:
                 headers = {'Authorization': f'Bearer {agent_key}'}
 
@@ -845,7 +848,7 @@ def test_hub_connection():
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 data = json.load(f)
-            hub_url = data.get('hub_url', '')
+            hub_url = data.get('hub_url', '').rstrip('/')
             agent_key = data.get('agent_key', '')
             if not hub_url or not agent_key:
                 return False
@@ -853,7 +856,8 @@ def test_hub_connection():
             resp = requests.get(f'{hub_url}/api/print-hub/heartbeat', headers=headers, timeout=5)
             return resp.status_code == 200
         return False
-    except Exception:
+    except Exception as e:
+        log.debug("test_hub_connection failed: %s", e)
         return False
 
 
