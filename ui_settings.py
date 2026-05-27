@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSpinBox, QCheckBox, QComboBox,
     QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView,
     QFormLayout, QGroupBox, QFrame, QListWidget, QSplitter,
-    QScrollArea, QProgressBar
+    QScrollArea, QProgressBar, QTextEdit, QGridLayout
 )
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont, QIcon, QColor, QPalette
@@ -708,8 +708,15 @@ class SettingsWindow(QDialog):
         self.btn_save_printer_config.clicked.connect(self.on_save_printer_config)
         self.btn_save_printer_config.setEnabled(False)
 
+        self.btn_view_caps = QPushButton("View Capabilities...")
+        self.btn_view_caps.setObjectName("printer_config_view_caps")
+        self.btn_view_caps.clicked.connect(self.on_view_capabilities)
+        self.btn_view_caps.setEnabled(False)
+        self.btn_view_caps.setToolTip("Open detailed capabilities dialog for the selected printer")
+
         btn_row.addWidget(self.btn_refresh_caps)
         btn_row.addWidget(self.btn_reset_printer_config)
+        btn_row.addWidget(self.btn_view_caps)
         btn_row.addStretch()
         btn_row.addWidget(self.btn_save_printer_config)
         right_layout.addLayout(btn_row)
@@ -791,6 +798,7 @@ class SettingsWindow(QDialog):
             self.btn_save_printer_config.setEnabled(False)
             self.btn_reset_printer_config.setEnabled(False)
             self.btn_refresh_caps.setEnabled(False)
+            self.btn_view_caps.setEnabled(False)
             return
 
         item = self.list_printers.item(row)
@@ -802,6 +810,7 @@ class SettingsWindow(QDialog):
         self.btn_save_printer_config.setEnabled(True)
         self.btn_reset_printer_config.setEnabled(True)
         self.btn_refresh_caps.setEnabled(True)
+        self.btn_view_caps.setEnabled(True)
         self.populate_printer_config_ui(printer_name)
 
     def on_refresh_capabilities(self):
@@ -980,6 +989,16 @@ class SettingsWindow(QDialog):
                 w.setChecked(field_def['default'])
 
         QMessageBox.information(self, "Reset", f"Configuration for '{printer_name}' reset to defaults.")
+
+    def on_view_capabilities(self):
+        """Open the capabilities drill-down dialog for the selected printer."""
+        printer_name = self.lbl_selected_printer.text()
+        if not printer_name or printer_name == "No printer selected":
+            log.debug("on_view_capabilities: no printer selected, skipping")
+            return
+
+        dlg = PrinterCapabilitiesDialog(printer_name, self)
+        dlg.exec()
 
     def setup_jobs_tab(self):
         tab = QWidget()
@@ -1215,13 +1234,15 @@ class SettingsWindow(QDialog):
             self.btn_test_conn.setText("Test Connection")
 
     def apply_settings(self):
-        """Apply settings changes live without restarting the app."""
-        # Notify the main app to reload config
+        """Apply settings changes live without restarting the app.
+
+        Uses a QTimer.singleShot to signal the server to reload config after save,
+        allowing the UI to close cleanly before the config reload takes effect.
+        """
+        # Use QTimer to signal reload — gives UI time to close before the
+        # config reload (which may restart hub sync or change intervals)
         if self.apply_callback:
-            try:
-                self.apply_callback()
-            except Exception as e:
-                log.error("Apply callback failed: %s", e)
+            QTimer.singleShot(200, self.apply_callback)
         
         # Show brief status message
         QMessageBox.information(
@@ -1367,6 +1388,291 @@ class SettingsWindow(QDialog):
         self.apply_styles()
         # Re-apply group box per-widget styles (they use inline stylesheets)
         self.refresh_status()
+
+
+# ─────────────────────────────────────────────
+#  Printer Capabilities Drill-Down Dialog
+# ─────────────────────────────────────────────
+
+class PrinterCapabilitiesDialog(QDialog):
+    """Detailed printer capabilities viewer with test print support.
+
+    Shows per-printer details for:
+      - Input trays (AutoSelect, Tray1, Tray2, ManualFeed, etc.)
+      - Media sizes (A4, Letter, Legal, custom sizes)
+      - Resolutions (600dpi, 1200dpi, etc.)
+      - Color modes (Color, Grayscale, CMYK)
+      - Duplex modes (None, TwoSidedLong, TwoSidedShort)
+    """
+
+    def __init__(self, printer_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Printer Capabilities — {printer_name}")
+        self.setMinimumSize(600, 500)
+        self.resize(600, 500)
+
+        self.printer_name = printer_name
+        self._capabilities: dict = {}
+        self._load_in_progress = False
+
+        self.setup_ui()
+        self.load_capabilities()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # ── Header ──
+        header_layout = QHBoxLayout()
+        self.lbl_printer_title = QLabel(f"<h2>{self.printer_name}</h2>")
+        header_layout.addWidget(self.lbl_printer_title)
+        header_layout.addStretch()
+
+        self.lbl_status = QLabel("Loading...")
+        self.lbl_status.setStyleSheet("color: #f0b34b; font-weight: 600;")
+        header_layout.addWidget(self.lbl_status)
+        layout.addLayout(header_layout)
+
+        # ── Capabilities Grid ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        self.caps_container = QWidget()
+        self.caps_layout = QVBoxLayout(self.caps_container)
+        self.caps_layout.setSpacing(10)
+        self.caps_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Placeholder label - will be populated after discovery
+        self.lbl_placeholder = QLabel("Querying printer capabilities...")
+        self.lbl_placeholder.setStyleSheet("color: #888; font-size: 13px; padding: 20px;")
+        self.lbl_placeholder.setAlignment(Qt.AlignCenter)
+        self.caps_layout.addWidget(self.lbl_placeholder)
+        self.caps_layout.addStretch()
+
+        scroll.setWidget(self.caps_container)
+        layout.addWidget(scroll, stretch=1)
+
+        # ── Bottom buttons ──
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.clicked.connect(self.load_capabilities)
+        btn_layout.addWidget(self.btn_refresh)
+
+        self.btn_test_print = QPushButton("Test Print...")
+        self.btn_test_print.setObjectName("save_btn")
+        self.btn_test_print.clicked.connect(self.on_test_print)
+        self.btn_test_print.setEnabled(False)
+        btn_layout.addWidget(self.btn_test_print)
+
+        btn_layout.addStretch()
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setObjectName("cancel_btn")
+        self.btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_close)
+
+        layout.addLayout(btn_layout)
+
+    def load_capabilities(self):
+        """Fetch capabilities in a background thread."""
+        if self._load_in_progress:
+            return
+        self._load_in_progress = True
+        self.lbl_status.setText("Loading...")
+        self.lbl_status.setStyleSheet("color: #f0b34b; font-weight: 600;")
+        self.btn_refresh.setEnabled(False)
+        self.btn_test_print.setEnabled(False)
+
+        def _do_load():
+            try:
+                caps = capabilities.discover_capabilities(self.printer_name)
+                # Schedule UI update on main thread
+                QTimer.singleShot(0, lambda: self._display_capabilities(caps))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._display_error(str(e)))
+
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _display_error(self, error_msg: str):
+        """Show an error message in the capabilities area."""
+        self._load_in_progress = False
+        self.lbl_status.setText("Error")
+        self.lbl_status.setStyleSheet("color: #e66565; font-weight: 600;")
+        self.btn_refresh.setEnabled(True)
+
+        # Clear layout
+        self._clear_caps_layout()
+        error_label = QLabel(f"Failed to discover capabilities:\n{error_msg}")
+        error_label.setStyleSheet("color: #e66565; font-size: 13px; padding: 20px;")
+        error_label.setAlignment(Qt.AlignCenter)
+        error_label.setWordWrap(True)
+        self.caps_layout.addWidget(error_label)
+        self.caps_layout.addStretch()
+
+    def _clear_caps_layout(self):
+        """Remove all widgets from the capabilities layout."""
+        while self.caps_layout.count():
+            item = self.caps_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _display_capabilities(self, caps: dict):
+        """Populate the UI with discovered capabilities."""
+        self._load_in_progress = False
+        self._capabilities = caps
+        self.lbl_status.setText("Ready")
+        self.lbl_status.setStyleSheet("color: #4caf88; font-weight: 600;")
+        self.btn_refresh.setEnabled(True)
+        self.btn_test_print.setEnabled(True)
+
+        # Clear existing widgets
+        self._clear_caps_layout()
+
+        # Check for error
+        if caps.get('error'):
+            error_label = QLabel(f"Capability error: {caps['error']}")
+            error_label.setStyleSheet("color: #e66565; font-size: 13px; padding: 20px;")
+            error_label.setAlignment(Qt.AlignCenter)
+            error_label.setWordWrap(True)
+            self.caps_layout.addWidget(error_label)
+            self.caps_layout.addStretch()
+            return
+
+        # ── Trays ──
+        trays = caps.get('trays', [])
+        self._add_section("Input Trays", trays, "No trays discovered")
+
+        # ── Media Sizes ──
+        media_sizes = caps.get('media_sizes', [])
+        self._add_section("Supported Media Sizes", media_sizes, "No media sizes discovered", is_media=True)
+
+        # ── Resolutions ──
+        resolutions = caps.get('resolutions', [])
+        self._add_section("Resolutions (DPI)", resolutions, "No resolutions discovered")
+
+        # ── Color Modes ──
+        color_modes = caps.get('color_modes', [])
+        self._add_section("Color Modes", color_modes, "No color modes discovered")
+
+        # ── Duplex ──
+        duplex = caps.get('duplex', [])
+        self._add_section("Duplex Modes", duplex, "No duplex modes discovered")
+
+        self.caps_layout.addStretch()
+
+    def _add_section(self, title: str, items: list, empty_msg: str, is_media: bool = False):
+        """Add a named section with capability items to the layout."""
+        group = QGroupBox(title)
+        group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: 700; font-size: 13px;
+                border: 1px solid #444; border-radius: 6px;
+                margin-top: 12px; padding: 14px 10px 8px 10px;
+                background: rgba(255,255,255,0.03);
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; subcontrol-position: top left;
+                padding: 2px 8px;
+            }}
+        """)
+
+        if not items:
+            group_layout = QVBoxLayout(group)
+            empty_label = QLabel(empty_msg)
+            empty_label.setStyleSheet("color: #888; font-size: 12px; font-style: italic;")
+            group_layout.addWidget(empty_label)
+        elif is_media and len(items) > 15:
+            # For large lists (many media sizes), use a scrollable text area
+            group_layout = QVBoxLayout(group)
+            text_area = QTextEdit()
+            text_area.setReadOnly(True)
+            text_area.setMaximumHeight(120)
+            text_area.setPlainText("\n".join(items))
+            text_area.setStyleSheet("font-size: 12px;")
+            group_layout.addWidget(text_area)
+        else:
+            group_layout = QVBoxLayout(group)
+            # Show as a flow of tags
+            tags_widget = QWidget()
+            tags_layout = QHBoxLayout(tags_widget)
+            tags_layout.setSpacing(6)
+            tags_layout.setContentsMargins(0, 0, 0, 0)
+            tags_layout.setAlignment(Qt.AlignLeft)
+
+            # Display in a grid-like fashion, up to 4 columns
+            cols = min(4, len(items))
+            grid = QGridLayout()
+            grid.setSpacing(6)
+            for idx, item in enumerate(items):
+                label = QLabel(f"  {item}  ")
+                label.setStyleSheet("""
+                    background: #2a2a2a; color: #ccc; font-size: 12px;
+                    padding: 4px 10px; border-radius: 4px;
+                    border: 1px solid #444;
+                """)
+                grid.addWidget(label, idx // cols, idx % cols, Qt.AlignLeft)
+
+            group_layout.addLayout(grid)
+
+        self.caps_layout.addWidget(group)
+
+    def on_test_print(self):
+        """Send a test print job to the selected printer."""
+        if not self._capabilities or self._capabilities.get('error'):
+            QMessageBox.warning(self, "Cannot Test Print",
+                                "Capabilities not available. Refresh capabilities first.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Test Print",
+            f"Send a test page to '{self.printer_name}'?\n\n"
+            "This will print a simple test page to verify printer connectivity.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.btn_test_print.setEnabled(False)
+        self.btn_test_print.setText("Printing...")
+        QApplication.processEvents()
+
+        def _do_test():
+            try:
+                # Generate a simple test page (PostScript or raw text)
+                test_data = (
+                    f"TrayPrint Test Page\n"
+                    f"====================\n\n"
+                    f"Printer: {self.printer_name}\n"
+                    f"Date: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Capabilities:\n"
+                    f"  Trays: {', '.join(self._capabilities.get('trays', ['N/A']))}\n"
+                    f"  Media: {', '.join(self._capabilities.get('media_sizes', ['N/A'])[:5])}\n"
+                    f"  Resolutions: {', '.join(self._capabilities.get('resolutions', ['N/A']))}\n"
+                    f"  Color Modes: {', '.join(self._capabilities.get('color_modes', ['N/A']))}\n"
+                    f"  Duplex: {', '.join(self._capabilities.get('duplex', ['N/A']))}\n\n"
+                    f"If you can read this, the printer is working correctly.\n"
+                )
+
+                # Use the server's raw print function directly
+                success, error = server.print_raw(self.printer_name, test_data)
+                if success:
+                    QTimer.singleShot(0, lambda: QMessageBox.information(
+                        self, "Test Print", f"Test page sent to '{self.printer_name}' successfully."))
+                else:
+                    QTimer.singleShot(0, lambda: QMessageBox.warning(
+                        self, "Test Print Failed", f"Failed to print test page:\n{error}"))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: QMessageBox.critical(
+                    self, "Test Print Error", str(e)))
+            finally:
+                QTimer.singleShot(0, lambda: self.btn_test_print.setEnabled(True))
+                QTimer.singleShot(0, lambda: self.btn_test_print.setText("Test Print..."))
+
+        threading.Thread(target=_do_test, daemon=True).start()
 
 
 def show_settings():

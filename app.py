@@ -907,7 +907,49 @@ class TrayApp:
             icon_char = '\u2713' if j['status'] == 'success' else '\u2717' if j['status'] == 'failed' else '\u2026'
             label = f"{icon_char} {j['printer']} ({j['type']}) {j['created_at'][11:19]}"
             act = menu.addAction(label)
-            act.setEnabled(False)
+            # Failed jobs get a retry action
+            if j['status'] == 'failed':
+                retry_menu = QMenu("Retry", menu)
+                retry_now = retry_menu.addAction("Retry Now")
+                retry_now.triggered.connect(lambda checked, job_id=j['id']: self._retry_job(job_id))
+                act.setMenu(retry_menu)
+                # Also make the main item clickable for quick retry
+                act.setToolTip(f"Failed: {j.get('error', 'Unknown error')}")
+            else:
+                act.setEnabled(False)
+
+    def _retry_job(self, job_id):
+        """Retry a failed print job by calling the server's retry endpoint."""
+        import requests
+        log.info("Retrying job %s from tray menu", job_id)
+        self.show_notification("Retry", f"Retrying job {job_id}...")
+        threading.Thread(
+            target=self._do_retry,
+            args=(job_id,),
+            daemon=True,
+        ).start()
+
+    def _do_retry(self, job_id):
+        """Execute the retry in a background thread."""
+        try:
+            resp = requests.post(
+                f'http://127.0.0.1:{self.port}/jobs/{job_id}/retry',
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get('status') == 'success':
+                    self.show_notification("Retry Success", f"Job {job_id} completed successfully")
+                else:
+                    self.show_notification("Retry Failed", f"Job {job_id}: {result.get('error', 'Unknown error')}")
+            else:
+                error_data = resp.json()
+                self.show_notification("Retry Failed", f"Job {job_id}: HTTP {resp.status_code} - {error_data.get('error', '')}")
+        except requests.exceptions.ConnectionError:
+            self.show_notification("Retry Failed", f"Cannot connect to local server to retry job {job_id}")
+        except Exception as e:
+            log.error("Retry failed for job %s: %s", job_id, e)
+            self.show_notification("Retry Error", f"Failed to retry job {job_id}: {e}")
 
     def view_logs(self):
         log_path = get_log_path()

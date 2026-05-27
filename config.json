@@ -4,10 +4,14 @@
     "*"
   ],
   "hub_url": "http://127.0.0.1:8082",
-  "agent_key": "HEIUndKNQsIW6eWvQLqDl7jcWwDu0EQi",
+  "agent_key": "vSSnGL2OjersI0SArxwHq5yc0l93JvFM",
   "autostart": false,
   "log_file": "trayprint.log",
   "max_job_history": 50,
   "sync_interval_seconds": 60,
-  "profiles": []
+  "profiles": [],
+  "reverb_host": "127.0.0.1",
+  "reverb_port": 8080,
+  "reverb_app_key": "",
+  "reverb_scheme": "ws"
 }

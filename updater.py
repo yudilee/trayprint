@@ -119,15 +119,21 @@ class UpdateChecker(threading.Thread):
             return latest_version > current
 
     def _get_current_version(self):
-        """Read the current version from config.json."""
-        config_path = Path(__file__).parent / 'config.json'
-        if config_path.exists():
-            try:
+        """Read the current version from the server module's APP_VERSION constant."""
+        try:
+            import server as srv
+            return getattr(srv, 'APP_VERSION', '1.0.0')
+        except (ImportError, AttributeError):
+            pass
+        # Fallback: try config.json
+        try:
+            config_path = Path(__file__).parent / 'config.json'
+            if config_path.exists():
                 with open(config_path) as f:
                     config = json.load(f)
                     return config.get('version', '1.0.0')
-            except (json.JSONDecodeError, OSError):
-                pass
+        except (json.JSONDecodeError, OSError):
+            pass
         return '1.0.0'
 
     # ── Download ──

@@ -447,6 +447,15 @@ _hub_last_status = "Disconnected"
 _cached_printer_count = 0
 _cached_printer_count_lock = threading.Lock()
 
+# Hot-reloadable sync config — updated by reload_config() so the sync loop
+# picks up new interval/retry values without restarting.
+_sync_config = {
+    "interval": 60,
+    "max_retries": 3,
+    "retry_delay": 60,
+}
+_sync_config_lock = threading.Lock()
+
 def get_hub_status():
     return _hub_last_status
 
@@ -470,9 +479,31 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
 
     hub_url = hub_url.rstrip('/')
 
+    # Seed the hot-reloadable sync config
+    with _sync_config_lock:
+        _sync_config["interval"] = interval
+        _sync_config["max_retries"] = max_retries
+        _sync_config["retry_delay"] = retry_delay
+
+    def _get_sync_interval():
+        """Read the current sync interval from the hot-reloadable config."""
+        with _sync_config_lock:
+            return _sync_config.get("interval", interval)
+
+    def _get_max_retries():
+        """Read the current max retries from the hot-reloadable config."""
+        with _sync_config_lock:
+            return _sync_config.get("max_retries", max_retries)
+
+    def _get_retry_delay():
+        """Read the current retry delay from the hot-reloadable config."""
+        with _sync_config_lock:
+            return _sync_config.get("retry_delay", retry_delay)
+
     def sync_loop():
-        profile_counter = interval  # Trigger immediately
-        status_counter = interval   # Trigger immediately
+        current_interval = _get_sync_interval()
+        profile_counter = current_interval  # Trigger immediately
+        status_counter = current_interval   # Trigger immediately
         backoff = 1
         max_backoff = 60
 
@@ -558,6 +589,9 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
                 log.debug("Queue refresh requested, resetting backoff")
                 backoff = 1
 
+            # Re-read sync interval from hot-reloadable config on each iteration
+            current_interval = _get_sync_interval()
+
             # Exponential backoff
             if jobs_found:
                 backoff = 1
@@ -579,6 +613,8 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
             job_type = hub_job['type']
             options = hub_job['options'] or {}
             b64_data = hub_job.get('document_base64')
+            current_max_retries = _get_max_retries()
+            current_retry_delay = _get_retry_delay()
 
             # Skip jobs pending approval
             approval_status = hub_job.get('approval_status', 'auto_approved')
@@ -631,7 +667,7 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
             _set_printing(True)
 
             try:
-                for attempt in range(max_retries):
+                for attempt in range(current_max_retries):
                     # Check cancel flag before each attempt
                     if _check_cancelled(job_id):
                         log.info("Job %s cancelled (attempt %d)", job_id, attempt + 1)
@@ -651,10 +687,10 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
                         success = False
                         error_msg = str(e)
 
-                    if not success and attempt < max_retries - 1:
+                    if not success and attempt < current_max_retries - 1:
                         # Check cancel flag during retry delay (poll every 1s)
-                        log.warning("Print failed. Retrying in %ds... (%d/%d)", retry_delay, attempt + 1, max_retries)
-                        for _ in range(retry_delay):
+                        log.warning("Print failed. Retrying in %ds... (%d/%d)", current_retry_delay, attempt + 1, current_max_retries)
+                        for _ in range(current_retry_delay):
                             if _check_cancelled(job_id):
                                 log.info("Job %s cancelled during retry wait", job_id)
                                 error_msg = 'Cancelled'
@@ -1263,6 +1299,21 @@ def reload_config():
                 _allowed_origins = data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
             load_profiles_from_config()
             load_watchdog_checks_config()
+
+            # Update hot-reloadable sync config so new interval/retry values take effect immediately
+            with _sync_config_lock:
+                new_interval = data.get('sync_interval_seconds', _sync_config.get("interval", 60))
+                new_max_retries = data.get('max_retries', _sync_config.get("max_retries", 3))
+                new_retry_delay = data.get('retry_delay_seconds', _sync_config.get("retry_delay", 60))
+                _sync_config["interval"] = new_interval
+                _sync_config["max_retries"] = new_max_retries
+                _sync_config["retry_delay"] = new_retry_delay
+                log.info("Sync config hot-reloaded: interval=%ds, max_retries=%d, retry_delay=%ds",
+                         new_interval, new_max_retries, new_retry_delay)
+
+            # Signal the sync loop to pick up new interval on next iteration
+            request_queue_refresh()
+
             log.info("Config reloaded: hub_url=%s, profiles=%d", _hub_url, len(_profiles))
             return True
     except Exception as e:
