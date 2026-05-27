@@ -444,6 +444,7 @@ def _check_hub_response(json_data, context=""):
 import queue as _queue
 _internal_print_queue = _queue.Queue()
 _hub_last_status = "Disconnected"
+_hub_sync_running = False
 _cached_printer_count = 0
 _cached_printer_count_lock = threading.Lock()
 
@@ -501,11 +502,23 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
             return _sync_config.get("retry_delay", retry_delay)
 
     def sync_loop():
+        # Send initial heartbeat + status report immediately so the hub marks
+        # this agent as online without waiting for the first interval cycle.
+        try:
+            log.info("Sync loop started — sending initial heartbeat")
+            report_status_to_hub(hub_url, agent_key)
+            headers_init = {'Authorization': f'Bearer {agent_key}'}
+            resp = requests.post(f'{hub_url}/api/print-hub/heartbeat', headers=headers_init, timeout=5)
+            if resp and resp.status_code == 200:
+                log.info("Initial heartbeat sent — agent marked online on hub")
+        except Exception as e:
+            log.debug("Initial heartbeat/status failed: %s", e)
+
         current_interval = _get_sync_interval()
-        profile_counter = current_interval  # Trigger immediately
-        status_counter = current_interval   # Trigger immediately
+        profile_counter = current_interval
+        status_counter = 0  # Reset to 0 since we just sent initial status
         backoff = 1
-        max_backoff = 60
+        max_backoff = 30  # Cap at 30s so heartbeats stay within hub's 2-min online threshold
 
         while True:
             jobs_found = False
@@ -742,6 +755,8 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
             except _queue.Empty:
                 time.sleep(1)
 
+    global _hub_sync_running
+    _hub_sync_running = True
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=spooler_loop, daemon=True).start()
     log.info("Hub sync & spooler started → %s (every %ds)", hub_url, interval)

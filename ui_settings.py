@@ -1198,6 +1198,19 @@ class SettingsWindow(QDialog):
                 
                 # Update server status so the main UI knows we are connected
                 server._hub_last_status = "Connected"
+                
+                # Ensure the hub sync loop is running with these credentials.
+                # If the sync loop was started at app boot with empty/wrong values,
+                # this (re)starts it with the correct hub_url and agent_key.
+                try:
+                    from server import start_hub_sync, _hub_sync_running
+                    if not _hub_sync_running:
+                        interval = self.spin_interval.value() if hasattr(self, 'spin_interval') else 60
+                        max_retries = self.spin_retries.value() if hasattr(self, 'spin_retries') else 3
+                        retry_delay = self.spin_retry_delay.value() if hasattr(self, 'spin_retry_delay') else 60
+                        start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
+                except Exception:
+                    pass
                     
                 QMessageBox.information(
                     self, "Success",

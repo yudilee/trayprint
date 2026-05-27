@@ -1028,6 +1028,13 @@ class TrayApp:
         hub_url = config.get("hub_url", "")
         agent_key = config.get("agent_key", "")
         if hub_url and agent_key:
+            # Test hub connection immediately so UI doesn't show stale "Disconnected"
+            if server.test_hub_connection():
+                server._hub_last_status = "Connected"
+                log.info("Hub reachable on startup (already connected)")
+            else:
+                server._hub_last_status = "Initializing..."
+                log.info("Hub not reachable on startup — sync loop will retry")
             interval = config.get("sync_interval_seconds", 60)
             max_retries = config.get("max_retries", 3)
             retry_delay = config.get("retry_delay_seconds", 60)
