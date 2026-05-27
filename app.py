@@ -550,14 +550,43 @@ def get_config(config_path_override=None):
             config_path = os.path.join(get_root_dir(), 'config.json')
 
     config_data = {"port": 49211}
+    loaded_from = None
+
+    # When frozen (PyInstaller), bundled files are in sys._MEIPASS
+    if getattr(sys, 'frozen', False):
+        try:
+            bundled_config = os.path.join(sys._MEIPASS, 'config.json')
+            if os.path.exists(bundled_config):
+                with open(bundled_config, 'r') as f:
+                    config_data.update(json.load(f))
+                loaded_from = bundled_config
+        except Exception as e:
+            log.debug("Could not load bundled config: %s", e)
+
+    # Load (or overlay) user config from the standard location
     try:
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
-                config_data.update(json.load(f))
+                # User config overlays bundled defaults
+                user_config = json.load(f)
+                config_data.update(user_config)
+            loaded_from = config_path
         else:
-            log.warning("Config file not found: %s", config_path)
+            # If no user config exists yet and we loaded bundled defaults,
+            # copy the bundled config to the user location so settings
+            # dialog can save modifications there
+            if loaded_from and loaded_from != config_path:
+                try:
+                    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                    import shutil
+                    shutil.copy2(loaded_from, config_path)
+                    log.info("Copied bundled config to %s for editing", config_path)
+                except Exception as copy_err:
+                    log.debug("Could not copy bundled config: %s", copy_err)
+            elif not loaded_from:
+                log.warning("Config file not found: %s", config_path)
     except Exception as e:
-        log.error("Error loading config from %s: %s", config_path, e)
+        log.error("Error loading user config from %s: %s", config_path, e)
 
     # Apply environment variable overrides
     config_data = apply_env_overrides(config_data)
