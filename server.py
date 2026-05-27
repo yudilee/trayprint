@@ -445,6 +445,7 @@ import queue as _queue
 _internal_print_queue = _queue.Queue()
 _hub_last_status = "Disconnected"
 _hub_sync_running = False
+_hub_sync_stop_event = threading.Event()
 _cached_printer_count = 0
 _cached_printer_count_lock = threading.Lock()
 

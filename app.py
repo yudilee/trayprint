@@ -624,23 +624,43 @@ INSTANCE_LOCK_KEY = "TrayPrint_SingleInstance_v3"
 
 
 def _check_instance_lock():
-    """Try to acquire a QSharedMemory lock; return False if another instance is running."""
-    shared_mem = QSharedMemory(INSTANCE_LOCK_KEY)
+    """Try to acquire a lock; return False if another instance is running.
+    
+    Uses a PID file as primary mechanism (more reliable across crashes),
+    with QSharedMemory as secondary guard.
+    """
+    # ── PID file lock (primary) ──
+    pid_path = os.path.join(get_data_dir(), "trayprint.pid")
+    try:
+        if os.path.exists(pid_path):
+            with open(pid_path, 'r') as f:
+                old_pid = int(f.read().strip())
+            # Check if the process with this PID is still alive
+            if os.path.exists(f'/proc/{old_pid}'):
+                log.warning("Another TrayPrint instance is already running (PID %d exists)", old_pid)
+                return False
+            else:
+                # Stale PID file — clean it up
+                log.info("Removing stale PID file from previous instance (PID %d)", old_pid)
+                os.remove(pid_path)
+        # Write our PID
+        os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+        with open(pid_path, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        log.debug("PID file lock failed, falling back to shared memory: %s", e)
+        # ── QSharedMemory (secondary fallback) ──
+        shared_mem = QSharedMemory(INSTANCE_LOCK_KEY)
+        if shared_mem.attach():
+            log.warning("Another TrayPrint instance is already running (shared memory key exists)")
+            shared_mem.detach()
+            return False
+        if not shared_mem.create(1):
+            log.warning("Another TrayPrint instance is already running (create failed)")
+            return False
+        _check_instance_lock._shared_mem = shared_mem
 
-    # Attach to an existing segment — if it exists, another instance is running
-    if shared_mem.attach():
-        log.warning("Another TrayPrint instance is already running (shared memory key exists)")
-        shared_mem.detach()
-        return False
-
-    # Try to create a new segment — if it fails, another instance beat us to it
-    if not shared_mem.create(1):
-        log.warning("Another TrayPrint instance is already running (create failed)")
-        return False
-
-    # Store reference so it stays alive for the process lifetime
-    _check_instance_lock._shared_mem = shared_mem
-    log.info("Single-instance lock acquired (%s)", INSTANCE_LOCK_KEY)
+    log.info("Single-instance lock acquired (PID %d)", os.getpid())
     return True
 
 
