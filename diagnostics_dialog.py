@@ -421,13 +421,33 @@ class DiagnosticsDialog(QDialog):
 
     def _show_error(self, message):
         """Display error in all tabs."""
-        self._lbl_app_version.setText(message)
-        self._lbl_os_version.setText(message)
-        self._lbl_hub_url.setText(message)
+        # Overview
+        for lbl in [self._lbl_app_version, self._lbl_python_version, self._lbl_platform,
+                     self._lbl_os_details, self._lbl_run_mode, self._lbl_uptime,
+                     self._lbl_config_path, self._lbl_config_exists, self._lbl_log_file]:
+            lbl.setText(message)
+        # System
+        for lbl in [self._lbl_os_version, self._lbl_python_ver, self._lbl_pyside6_ver,
+                     self._lbl_pymupdf_ver, self._lbl_architecture, self._lbl_machine,
+                     self._lbl_processor, self._lbl_hostname]:
+            lbl.setText(message)
+        # Network
+        for lbl in [self._lbl_hub_url, self._lbl_hub_reachable, self._lbl_last_sync,
+                     self._lbl_ws_status, self._lbl_proxy]:
+            lbl.setText(message)
+        # Printers
         self._printer_tree.clear()
+        # Jobs
+        for lbl in [self._lbl_total_jobs, self._lbl_success_jobs, self._lbl_failed_jobs, self._lbl_pending_jobs]:
+            lbl.setText(message)
         self._jobs_text.setText(message)
+        # Logs
         self._logs_text.setText(message)
-        self._lbl_wd_running.setText(message)
+        # Watchdog
+        for lbl in [self._lbl_wd_running, self._lbl_wd_last_check, self._lbl_wd_restarts,
+                     self._lbl_wd_memory, self._lbl_wd_disk, self._lbl_wd_ws]:
+            lbl.setText(message)
+        self._wd_log_text.setText(message)
 
     def _populate_from_data(self, data):
         """Populate all tabs from diagnostics data."""
@@ -460,12 +480,20 @@ class DiagnosticsDialog(QDialog):
         hub_reachable = data.get('hub_reachable', data.get('hub_connected', False))
         self._lbl_hub_reachable.setText(str(hub_reachable))
         self._lbl_last_sync.setText(data.get('last_sync_time', 'N/A'))
-        self._lbl_ws_status.setText(data.get('websocket_status', 'N/A'))
+        # websocket_status is a dict from server: {"connected": bool, "reconnect_count": int}
+        ws_status = data.get('websocket_status', {})
+        if isinstance(ws_status, dict):
+            connected = ws_status.get('connected', False)
+            reconnects = ws_status.get('reconnect_count', 0)
+            ws_str = f"Connected: {connected} | Reconnects: {reconnects}"
+        else:
+            ws_str = str(ws_status)
+        self._lbl_ws_status.setText(ws_str)
         proxy = data.get('proxy_config', {})
-        if proxy:
+        if proxy and isinstance(proxy, dict):
             proxy_str = json.dumps(proxy, indent=2)
         else:
-            proxy_str = 'None configured'
+            proxy_str = str(proxy) if proxy else 'None configured'
         self._lbl_proxy.setText(proxy_str)
 
         # ── Printers Tab ──
