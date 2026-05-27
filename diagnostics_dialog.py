@@ -420,34 +420,35 @@ class DiagnosticsDialog(QDialog):
             self._btn_refresh.setText("Refresh")
 
     def _show_error(self, message):
-        """Display error in all tabs."""
+        """Display error in all tabs. Converts message to string to prevent TypeError."""
+        msg_str = str(message)
         # Overview
         for lbl in [self._lbl_app_version, self._lbl_python_version, self._lbl_platform,
                      self._lbl_os_details, self._lbl_run_mode, self._lbl_uptime,
                      self._lbl_config_path, self._lbl_config_exists, self._lbl_log_file]:
-            lbl.setText(message)
+            lbl.setText(msg_str)
         # System
         for lbl in [self._lbl_os_version, self._lbl_python_ver, self._lbl_pyside6_ver,
                      self._lbl_pymupdf_ver, self._lbl_architecture, self._lbl_machine,
                      self._lbl_processor, self._lbl_hostname]:
-            lbl.setText(message)
+            lbl.setText(msg_str)
         # Network
         for lbl in [self._lbl_hub_url, self._lbl_hub_reachable, self._lbl_last_sync,
                      self._lbl_ws_status, self._lbl_proxy]:
-            lbl.setText(message)
+            lbl.setText(msg_str)
         # Printers
         self._printer_tree.clear()
         # Jobs
         for lbl in [self._lbl_total_jobs, self._lbl_success_jobs, self._lbl_failed_jobs, self._lbl_pending_jobs]:
-            lbl.setText(message)
-        self._jobs_text.setText(message)
+            lbl.setText(msg_str)
+        self._jobs_text.setText(msg_str)
         # Logs
-        self._logs_text.setText(message)
+        self._logs_text.setText(msg_str)
         # Watchdog
         for lbl in [self._lbl_wd_running, self._lbl_wd_last_check, self._lbl_wd_restarts,
                      self._lbl_wd_memory, self._lbl_wd_disk, self._lbl_wd_ws]:
-            lbl.setText(message)
-        self._wd_log_text.setText(message)
+            lbl.setText(msg_str)
+        self._wd_log_text.setText(msg_str)
 
     def _populate_from_data(self, data):
         """Populate all tabs from diagnostics data."""
@@ -565,7 +566,12 @@ class DiagnosticsDialog(QDialog):
         """Populate logs section."""
         logs = data.get('logs', '')
         if logs:
-            self._logs_text.setText(logs)
+            # Server may return logs as a list of strings or a single string
+            if isinstance(logs, list):
+                logs_str = "\n".join(logs)
+            else:
+                logs_str = str(logs)
+            self._logs_text.setText(logs_str)
         else:
             # Try reading from log file directly
             log_path = get_log_path()
