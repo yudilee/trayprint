@@ -474,7 +474,20 @@ def get_cached_printer_count():
         return _cached_printer_count
 
 def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
-    """Periodically pull profiles and print queue from the central hub."""
+    """Periodically pull profiles and print queue from the central hub.
+    
+    If a previous sync loop is running, it will be signalled to stop
+    before starting a new one. This allows hot-reloading the hub URL
+    or agent key without restarting the entire application.
+    """
+    global _hub_sync_running
+    # Signal the old sync loop to stop (if running)
+    _hub_sync_stop_event.set()
+    # Give it a moment to notice the stop signal
+    import time as _time
+    _time.sleep(0.5)
+    # Clear the stop event for the new loop
+    _hub_sync_stop_event.clear()
     import requests
     import base64
 
@@ -505,14 +518,19 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
         # Send initial heartbeat + status report immediately so the hub marks
         # this agent as online without waiting for the first interval cycle.
         try:
-            log.info("Sync loop started — sending initial heartbeat")
+            log.info("Sync loop started (hub_url=%s) — sending initial heartbeat", hub_url)
             report_status_to_hub(hub_url, agent_key)
             headers_init = {'Authorization': f'Bearer {agent_key}'}
-            resp = requests.post(f'{hub_url}/api/print-hub/heartbeat', headers=headers_init, timeout=5)
+            hb_url = f'{hub_url}/api/print-hub/heartbeat'
+            log.info("Sending heartbeat to %s", hb_url)
+            resp = requests.post(hb_url, headers=headers_init, timeout=5)
             if resp and resp.status_code == 200:
                 log.info("Initial heartbeat sent — agent marked online on hub")
+            else:
+                code = resp.status_code if resp else 'no response'
+                log.warning("Initial heartbeat returned HTTP %s", code)
         except Exception as e:
-            log.debug("Initial heartbeat/status failed: %s", e)
+            log.warning("Initial heartbeat/status failed: %s", e)
 
         current_interval = _get_sync_interval()
         profile_counter = current_interval
@@ -610,6 +628,12 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
                 backoff = 1
             else:
                 backoff = min(backoff * 2, max_backoff)
+
+            # Check if we should stop (e.g., on sync restart with new hub URL)
+            if _hub_sync_stop_event.is_set():
+                log.info("Sync loop stopping (restart requested)")
+                _hub_sync_running = False
+                return
 
             time.sleep(backoff)
             profile_counter += backoff

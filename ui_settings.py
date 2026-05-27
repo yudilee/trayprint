@@ -1199,18 +1199,19 @@ class SettingsWindow(QDialog):
                 # Update server status so the main UI knows we are connected
                 server._hub_last_status = "Connected"
                 
-                # Ensure the hub sync loop is running with these credentials.
-                # If the sync loop was started at app boot with empty/wrong values,
-                # this (re)starts it with the correct hub_url and agent_key.
+                # Restart the hub sync loop with the CURRENT credentials (hub_url, agent_key).
+                # The sync loop may have been started at app boot with old/wrong values
+                # (e.g. the bundled default hub_url = 127.0.0.1:8082). This ensures
+                # heartbeats go to the correct production URL.
                 try:
-                    from server import start_hub_sync, _hub_sync_running
-                    if not _hub_sync_running:
-                        interval = self.spin_interval.value() if hasattr(self, 'spin_interval') else 60
-                        max_retries = self.spin_retries.value() if hasattr(self, 'spin_retries') else 3
-                        retry_delay = self.spin_retry_delay.value() if hasattr(self, 'spin_retry_delay') else 60
-                        start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
-                except Exception:
-                    pass
+                    from server import start_hub_sync
+                    interval = self.spin_interval.value() if hasattr(self, 'spin_interval') else 60
+                    max_retries = self.spin_retries.value() if hasattr(self, 'spin_retries') else 3
+                    retry_delay = self.spin_retry_delay.value() if hasattr(self, 'spin_retry_delay') else 60
+                    start_hub_sync(hub_url, agent_key, interval, max_retries, retry_delay)
+                    log.info("Hub sync restarted with production URL: %s", hub_url)
+                except Exception as sync_err:
+                    log.warning("Could not restart hub sync: %s", sync_err)
                     
                 QMessageBox.information(
                     self, "Success",

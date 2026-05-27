@@ -563,6 +563,28 @@ def get_config(config_path_override=None):
         except Exception as e:
             log.debug("Could not load bundled config: %s", e)
 
+        # When frozen, also look for existing user config in the source directory
+        # (parent of dist/) and in the standard data directory, since users may
+        # have previously configured the app from source
+        try:
+            import platform as _pf
+            # Look in sibling directory (e.g., ../config.json relative to dist/)
+            sibling_config = os.path.join(os.path.dirname(get_root_dir()), 'config.json')
+            if os.path.exists(sibling_config) and sibling_config != config_path:
+                with open(sibling_config, 'r') as f:
+                    config_data.update(json.load(f))
+                loaded_from = sibling_config
+                log.info("Found existing config at %s", sibling_config)
+            # Also check the user data directory
+            data_dir_config = os.path.join(get_data_dir(), 'config.json')
+            if os.path.exists(data_dir_config) and data_dir_config != config_path:
+                with open(data_dir_config, 'r') as f:
+                    config_data.update(json.load(f))
+                loaded_from = data_dir_config
+                log.info("Found existing config at %s", data_dir_config)
+        except Exception as e:
+            log.debug("Could not load fallback config: %s", e)
+
     # Load (or overlay) user config from the standard location
     try:
         if os.path.exists(config_path):
@@ -572,17 +594,16 @@ def get_config(config_path_override=None):
                 config_data.update(user_config)
             loaded_from = config_path
         else:
-            # If no user config exists yet and we loaded bundled defaults,
-            # copy the bundled config to the user location so settings
-            # dialog can save modifications there
+            # If no user config exists yet and we found existing config elsewhere,
+            # copy it to the standard location so settings dialog can save there
             if loaded_from and loaded_from != config_path:
                 try:
                     os.makedirs(os.path.dirname(config_path), exist_ok=True)
                     import shutil
                     shutil.copy2(loaded_from, config_path)
-                    log.info("Copied bundled config to %s for editing", config_path)
+                    log.info("Copied existing config from %s to %s", loaded_from, config_path)
                 except Exception as copy_err:
-                    log.debug("Could not copy bundled config: %s", copy_err)
+                    log.debug("Could not copy config: %s", copy_err)
             elif not loaded_from:
                 log.warning("Config file not found: %s", config_path)
     except Exception as e:
