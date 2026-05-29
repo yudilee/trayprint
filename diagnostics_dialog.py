@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 
-from path_utils import get_root_dir
+from path_utils import get_root_dir, get_data_dir
 from logger import get_logger, get_log_path
 from theme import get_stylesheet, get_palette
 
@@ -35,7 +35,16 @@ class DiagnosticsDialog(QDialog):
         self.setMinimumSize(800, 650)
         self.resize(900, 700)
 
+        # Load settings theme dynamically
         self._theme_id = 'dark'
+        config_path = os.path.join(get_data_dir(), 'config.json')
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self._theme_id = config.get('theme', 'dark')
+            except Exception:
+                pass
         self._theme = get_palette(self._theme_id)
 
         # Auto-refresh state
@@ -455,32 +464,32 @@ class DiagnosticsDialog(QDialog):
         self._raw_data = data  # Store for export
 
         # ── Overview Tab ──
-        self._lbl_app_version.setText(data.get('app_version', 'N/A'))
-        self._lbl_python_version.setText(data.get('python_version', 'N/A'))
-        self._lbl_platform.setText(data.get('platform', 'N/A'))
-        self._lbl_os_details.setText(data.get('os_details', 'N/A'))
-        self._lbl_run_mode.setText(data.get('run_mode', 'N/A'))
-        self._lbl_uptime.setText(data.get('uptime', 'N/A'))
-        self._lbl_config_path.setText(data.get('config_path', 'N/A'))
+        self._lbl_app_version.setText(str(data.get('app_version', 'N/A')))
+        self._lbl_python_version.setText(str(data.get('python_version', 'N/A')))
+        self._lbl_platform.setText(str(data.get('platform', 'N/A')))
+        self._lbl_os_details.setText(str(data.get('os_details', 'N/A')))
+        self._lbl_run_mode.setText(str(data.get('run_mode', 'N/A')))
+        self._lbl_uptime.setText(str(data.get('uptime', 'N/A')))
+        self._lbl_config_path.setText(str(data.get('config_path', 'N/A')))
         self._lbl_config_exists.setText(str(data.get('config_exists', False)))
-        self._lbl_log_file.setText(data.get('log_file', 'N/A'))
+        self._lbl_log_file.setText(str(data.get('log_file', 'N/A')))
 
         # ── System Info Tab ──
         sys_info = data.get('system_info', {})
-        self._lbl_os_version.setText(sys_info.get('os_version', _platform.platform()))
-        self._lbl_python_ver.setText(sys_info.get('python_version', sys.version.split()[0]))
-        self._lbl_pyside6_ver.setText(sys_info.get('pyside6_version', 'N/A'))
-        self._lbl_pymupdf_ver.setText(sys_info.get('pymupdf_version', 'N/A'))
-        self._lbl_architecture.setText(sys_info.get('architecture', 'N/A'))
-        self._lbl_machine.setText(sys_info.get('machine', 'N/A'))
-        self._lbl_processor.setText(sys_info.get('processor', 'N/A'))
-        self._lbl_hostname.setText(sys_info.get('hostname', 'N/A'))
+        self._lbl_os_version.setText(str(sys_info.get('os_version', _platform.platform())))
+        self._lbl_python_ver.setText(str(sys_info.get('python_version', sys.version.split()[0])))
+        self._lbl_pyside6_ver.setText(str(sys_info.get('pyside6_version', 'N/A')))
+        self._lbl_pymupdf_ver.setText(str(sys_info.get('pymupdf_version', 'N/A')))
+        self._lbl_architecture.setText(str(sys_info.get('architecture', 'N/A')))
+        self._lbl_machine.setText(str(sys_info.get('machine', 'N/A')))
+        self._lbl_processor.setText(str(sys_info.get('processor', 'N/A')))
+        self._lbl_hostname.setText(str(sys_info.get('hostname', 'N/A')))
 
         # ── Network Tab ──
-        self._lbl_hub_url.setText(data.get('hub_url', 'N/A'))
+        self._lbl_hub_url.setText(str(data.get('hub_url', 'N/A')))
         hub_reachable = data.get('hub_reachable', data.get('hub_connected', False))
         self._lbl_hub_reachable.setText(str(hub_reachable))
-        self._lbl_last_sync.setText(data.get('last_sync_time', 'N/A'))
+        self._lbl_last_sync.setText(str(data.get('last_sync_time', 'N/A')))
         # websocket_status is a dict from server: {"connected": bool, "reconnect_count": int}
         ws_status = data.get('websocket_status', {})
         if isinstance(ws_status, dict):

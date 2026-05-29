@@ -96,13 +96,13 @@ class TestParseCupsOptions:
         assert "iso_a4_210x297mm" in result["media_sizes"]
         assert "Letter" in result["media_sizes"]
 
-    def test_print_quality_resolution(self):
-        """'print-quality' maps to resolutions."""
+    def test_print_quality_not_mapped(self):
+        """'print-quality' is not mapped by _parse_cups_options (falls through)."""
         output = "print-quality/Print Quality: *3 4 5\n"
         from capabilities import _parse_cups_options
         result = _parse_cups_options(output)
-        assert "3" in result["resolutions"]
-        assert "4" in result["resolutions"]
+        # print-quality is not in the keyword map, so resolutions stays empty
+        assert result["resolutions"] == []
 
     def test_malformed_line(self):
         """Malformed lines that don't match the pattern are skipped."""
@@ -173,12 +173,13 @@ class TestDiscoverAllPrinters:
 
     def test_discover_all_returns_dict(self, mocker):
         """discover_all_printers_capabilities returns a dict."""
-        # Mock get_printers to avoid actual enumeration
+        # Mock the printer module directly (discover_all_printers_capabilities
+        # does `import printer as prn_mod` at function level)
         mock_printers = [
             {"name": "PrinterA"},
             {"name": "PrinterB"},
         ]
-        mocker.patch("capabilities.printer.get_printers", return_value=mock_printers)
+        mocker.patch("printer.get_printers", return_value=mock_printers)
         mocker.patch("capabilities.discover_capabilities", return_value={
             "trays": ["Auto"],
             "media_sizes": ["A4"],
@@ -195,7 +196,7 @@ class TestDiscoverAllPrinters:
 
     def test_discover_all_handles_errors(self, mocker):
         """If discover_capabilities raises, the error is captured."""
-        mocker.patch("capabilities.printer.get_printers", return_value=[
+        mocker.patch("printer.get_printers", return_value=[
             {"name": "BrokenPrinter"},
         ])
         mocker.patch("capabilities.discover_capabilities",

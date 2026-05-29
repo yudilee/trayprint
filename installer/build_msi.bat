@@ -83,7 +83,7 @@ echo.
 pushd "%SCRIPT_DIR%"
 
 echo [1/2] Compiling WiX source...
-%CANDLE% -ext WixUtilExtension product.wxs -out product.wixobj
+%CANDLE% -ext WixUtilExtension -dVersion=1.0.0 trayprint.wxs -out trayprint.wixobj
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] WiX compilation failed (candle.exe exit code %ERRORLEVEL%).
     popd
@@ -91,7 +91,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [2/2] Linking MSI package...
-%LIGHT% -ext WixUtilExtension -out "TrayPrint.msi" product.wixobj
+%LIGHT% -ext WixUtilExtension -ext WixUIExtension -out "TrayPrint.msi" trayprint.wixobj
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] WiX linking failed (light.exe exit code %ERRORLEVEL%).
     popd

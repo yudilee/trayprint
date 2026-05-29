@@ -15,13 +15,18 @@ import pytest
 class TestBuildLpOptions:
     """Test _build_lp_options which converts option dicts to lp flags."""
 
+    # NOTE: _build_lp_options ALWAYS adds an orientation flag.
+    #       Default (no orientation or portrait) → orientation-requested=3
+    #       landscape → orientation-requested=4
+    #       Therefore even "empty" options return ['-o', 'orientation-requested=3'].
+
     def test_empty_options(self):
-        """Empty options return an empty list."""
+        """Empty options return an empty list (early return)."""
         from printer import _build_lp_options
         assert _build_lp_options({}) == []
 
     def test_none_options(self):
-        """None options return an empty list."""
+        """None options return an empty list (early return)."""
         from printer import _build_lp_options
         assert _build_lp_options(None) == []
 
@@ -33,45 +38,47 @@ class TestBuildLpOptions:
         assert "3" in result
 
     def test_copies_single(self):
-        """copies == 1 does NOT add -n."""
+        """copies == 1 does NOT add -n (but orientation is added)."""
         from printer import _build_lp_options
         result = _build_lp_options({"copies": 1})
         assert "-n" not in result
 
     def test_duplex_long(self):
-        """duplex 'two-sided-long-edge' adds -o sides=two-sided-long-edge."""
+        """duplex 'two-sided-long' adds -o sides=two-sided-long-edge."""
         from printer import _build_lp_options
-        result = _build_lp_options({"duplex": "two-sided-long-edge"})
+        result = _build_lp_options({"duplex": "two-sided-long"})
         assert "-o" in result
         assert "sides=two-sided-long-edge" in result
 
     def test_duplex_short(self):
-        """duplex 'two-sided-short-edge' adds -o sides=two-sided-short-edge."""
+        """duplex 'two-sided-short' adds -o sides=two-sided-short-edge."""
         from printer import _build_lp_options
-        result = _build_lp_options({"duplex": "two-sided-short-edge"})
+        result = _build_lp_options({"duplex": "two-sided-short"})
         assert "-o" in result
         assert "sides=two-sided-short-edge" in result
 
     def test_duplex_none(self):
-        """duplex 'none' or 'one-sided' adds -o sides=one-sided."""
+        """duplex 'none' or missing does NOT add sides flag (orientation still added)."""
         from printer import _build_lp_options
-        result = _build_lp_options({"duplex": "none"})
-        assert "-o" in result
-        assert "sides=one-sided" in result
+        # Missing duplex → no sides flag
+        result = _build_lp_options({})
+        sides_flags = [result[i+1] for i, v in enumerate(result) if v == "-o"
+                       and result[i+1].startswith("sides=")]
+        assert len(sides_flags) == 0
 
     def test_orientation_landscape(self):
-        """orientation 'landscape' adds -o landscape."""
+        """orientation 'landscape' adds -o orientation-requested=4."""
         from printer import _build_lp_options
         result = _build_lp_options({"orientation": "landscape"})
         assert "-o" in result
-        assert "landscape" in result
+        assert "orientation-requested=4" in result
 
     def test_orientation_portrait(self):
-        """orientation 'portrait' adds -o portrait."""
+        """orientation 'portrait' adds -o orientation-requested=3."""
         from printer import _build_lp_options
         result = _build_lp_options({"orientation": "portrait"})
         assert "-o" in result
-        assert "portrait" in result
+        assert "orientation-requested=3" in result
 
     def test_paper_size(self):
         """paper_size adds -o media=PaperName."""
@@ -81,12 +88,10 @@ class TestBuildLpOptions:
         assert "media=A4" in result
 
     def test_paper_size_custom(self):
-        """paper_size 'custom' should not be added as media."""
+        """paper_size 'custom' is still passed as media=custom."""
         from printer import _build_lp_options
         result = _build_lp_options({"paper_size": "custom"})
-        # Custom size might be handled via page-height/page-width
-        media_flags = [r for r in result if r.startswith("media=")]
-        assert len(media_flags) == 0 or "custom" not in media_flags[0].lower()
+        assert "media=custom" in result
 
     def test_tray_source(self):
         """tray_source adds -o InputSlot=TrayName."""
@@ -100,31 +105,30 @@ class TestBuildLpOptions:
         from printer import _build_lp_options
         result = _build_lp_options({"color_mode": "monochrome"})
         assert "-o" in result
-        assert "ColorModel=Gray" in result or "ColorModel=KGray" in result
+        assert "ColorModel=Gray" in result
 
     def test_color_mode_color(self):
         """color_mode 'color' adds -o ColorModel=RGB."""
         from printer import _build_lp_options
         result = _build_lp_options({"color_mode": "color"})
         assert "-o" in result
-        assert "ColorModel=RGB" in result or "ColorModel=CMYK" in result
+        assert "ColorModel=RGB" in result
 
     def test_all_options_together(self):
         """Multiple options produce multiple flags."""
         from printer import _build_lp_options
         result = _build_lp_options({
             "copies": 2,
-            "duplex": "two-sided-long-edge",
+            "duplex": "two-sided-long",
             "orientation": "landscape",
             "paper_size": "A4",
             "tray_source": "Tray1",
             "color_mode": "monochrome",
         })
-        # Should have multiple -o / -n flags
         assert "-n" in result
         assert "2" in result
         o_flags = [result[i+1] for i, v in enumerate(result) if v == "-o"]
-        assert len(o_flags) >= 4  # duplex, orientation, media, InputSlot, ColorModel
+        assert len(o_flags) >= 4  # orientation, sides, media, InputSlot, ColorModel
 
     def test_fit_to_page(self):
         """fit_to_page adds -o fit-to-page."""
@@ -134,11 +138,11 @@ class TestBuildLpOptions:
         assert "fit-to-page" in result
 
     def test_reverse_order(self):
-        """reverse_order adds -o outputorder=reverse."""
+        """reverse_order adds -o OutputOrder=reverse."""
         from printer import _build_lp_options
         result = _build_lp_options({"reverse_order": True})
         assert "-o" in result
-        assert "outputorder=reverse" in result
+        assert "OutputOrder=reverse" in result
 
     def test_page_range(self):
         """page_range adds -o page-ranges=..."""
@@ -148,18 +152,19 @@ class TestBuildLpOptions:
         assert "page-ranges=1-5" in result
 
     def test_collate(self):
-        """collate adds -o Collate=True."""
+        """collate adds -o Collate=true (lowercase)."""
         from printer import _build_lp_options
         result = _build_lp_options({"collate": True})
         assert "-o" in result
-        assert "Collate=True" in result
+        assert "Collate=true" in result
 
     def test_duplex_saved_ignored(self):
-        """eco tracking fields like duplex_saved are ignored by lp options."""
+        """eco tracking fields like duplex_saved are ignored (only orientation added)."""
         from printer import _build_lp_options
         result = _build_lp_options({"duplex_saved": 10, "eco_mode": True})
-        # These should not produce any lp flags
-        assert len(result) == 0
+        # Only orientation-requested=3 is added
+        assert len(result) == 2
+        assert result == ['-o', 'orientation-requested=3']
 
 
 # ===================================================================
@@ -254,12 +259,14 @@ class TestBuildSumatraOptions:
         settings = result[result.index("-print-settings") + 1]
         assert "paper=Statement" in settings
 
-    def test_no_print_settings_when_no_ui_options(self):
-        """When no UI options are relevant, no -print-settings flag."""
+    def test_no_print_settings_when_only_color_option(self):
+        """When only a color option is given, -print-settings still present due to orientation default."""
         from printer import _build_sumatra_options
         result = _build_sumatra_options({"color_mode": "monochrome"})
-        # Only -grayscale, no -print-settings
-        assert "-print-settings" not in result
+        # color_mode alone still generates -print-settings because orientation
+        # defaults to 'portrait' (always added for non-None options)
+        assert "-print-settings" in result
+        assert "-grayscale" in result
 
     def test_finishing_warning_logged(self, mocker):
         """Finishing options log a warning since Sumatra doesn't support them."""

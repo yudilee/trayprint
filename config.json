@@ -9,7 +9,22 @@
   "log_file": "trayprint.log",
   "max_job_history": 50,
   "sync_interval_seconds": 60,
-  "profiles": [],
+  "profiles": [
+    {
+      "printer": "P1",
+      "name": "Profile1",
+      "options": {
+        "copies": 1
+      }
+    },
+    {
+      "printer": "P2",
+      "name": "Profile2",
+      "options": {
+        "duplex": "long"
+      }
+    }
+  ],
   "reverb_host": "127.0.0.1",
   "reverb_port": 8080,
   "reverb_app_key": "",

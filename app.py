@@ -19,10 +19,10 @@ Environment variables:
     TRAYPRINT_CONFIG_PATH   Override config file path
 """
 
+import sys
 import argparse
 import threading
 import os
-import sys
 import json
 import subprocess
 import webbrowser
@@ -527,32 +527,12 @@ def create_tray_icon(printing=False):
 
 def get_config(config_path_override=None):
     """
-    Load configuration from config.json, with optional path override.
-
-    Parameters
-    ----------
-    config_path_override : str or None
-        If provided, use this path instead of the default config.json.
-
-    Returns
-    -------
-    dict
-        Configuration dictionary.
+    Load configuration: bundled defaults -> install config -> user config.
     """
-    if config_path_override:
-        config_path = config_path_override
-    else:
-        # Check for env var override
-        env_config = os.environ.get("TRAYPRINT_CONFIG_PATH")
-        if env_config:
-            config_path = env_config
-        else:
-            config_path = os.path.join(get_root_dir(), 'config.json')
-
     config_data = {"port": 49211}
     loaded_from = None
 
-    # When frozen (PyInstaller), bundled files are in sys._MEIPASS
+    # 1. Bundled config (if frozen via PyInstaller)
     if getattr(sys, 'frozen', False):
         try:
             bundled_config = os.path.join(sys._MEIPASS, 'config.json')
@@ -563,53 +543,48 @@ def get_config(config_path_override=None):
         except Exception as e:
             log.debug("Could not load bundled config: %s", e)
 
-        # When frozen, also look for existing user config in the source directory
-        # (parent of dist/) and in the standard data directory, since users may
-        # have previously configured the app from source
+    # 2. Installation-wide defaults (from Program Files install directory)
+    install_config = os.path.join(get_root_dir(), 'config.json')
+    if os.path.exists(install_config):
         try:
-            import platform as _pf
-            # Look in sibling directory (e.g., ../config.json relative to dist/)
-            sibling_config = os.path.join(os.path.dirname(get_root_dir()), 'config.json')
-            if os.path.exists(sibling_config) and sibling_config != config_path:
-                with open(sibling_config, 'r') as f:
-                    config_data.update(json.load(f))
-                loaded_from = sibling_config
-                log.info("Found existing config at %s", sibling_config)
-            # Also check the user data directory
-            data_dir_config = os.path.join(get_data_dir(), 'config.json')
-            if os.path.exists(data_dir_config) and data_dir_config != config_path:
-                with open(data_dir_config, 'r') as f:
-                    config_data.update(json.load(f))
-                loaded_from = data_dir_config
-                log.info("Found existing config at %s", data_dir_config)
+            with open(install_config, 'r') as f:
+                config_data.update(json.load(f))
+            loaded_from = install_config
         except Exception as e:
-            log.debug("Could not load fallback config: %s", e)
+            log.error("Error loading install config from %s: %s", install_config, e)
 
-    # Load (or overlay) user config from the standard location
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                # User config overlays bundled defaults
-                user_config = json.load(f)
-                config_data.update(user_config)
-            loaded_from = config_path
+    # 3. User configuration overrides (from AppData)
+    user_config_path = None
+    if config_path_override:
+        user_config_path = config_path_override
+    else:
+        env_config = os.environ.get("TRAYPRINT_CONFIG_PATH")
+        if env_config:
+            user_config_path = env_config
         else:
-            # If no user config exists yet and we found existing config elsewhere,
-            # copy it to the standard location so settings dialog can save there
-            if loaded_from and loaded_from != config_path:
-                try:
-                    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-                    import shutil
-                    shutil.copy2(loaded_from, config_path)
-                    log.info("Copied existing config from %s to %s", loaded_from, config_path)
-                except Exception as copy_err:
-                    log.debug("Could not copy config: %s", copy_err)
-            elif not loaded_from:
-                log.warning("Config file not found: %s", config_path)
-    except Exception as e:
-        log.error("Error loading user config from %s: %s", config_path, e)
+            user_config_path = os.path.join(get_data_dir(), 'config.json')
 
-    # Apply environment variable overrides
+    if user_config_path and os.path.abspath(user_config_path) != os.path.abspath(install_config):
+        try:
+            if os.path.exists(user_config_path):
+                with open(user_config_path, 'r') as f:
+                    user_config = json.load(f)
+                    config_data.update(user_config)
+                loaded_from = user_config_path
+            else:
+                # Initialize user config with install config on first run so Settings can modify it
+                if loaded_from and loaded_from == install_config:
+                    try:
+                        os.makedirs(os.path.dirname(user_config_path), exist_ok=True)
+                        import shutil
+                        shutil.copy2(loaded_from, user_config_path)
+                        log.info("Initialized user config at %s from %s", user_config_path, loaded_from)
+                    except Exception as copy_err:
+                        log.debug("Could not copy config: %s", copy_err)
+        except Exception as e:
+            log.error("Error loading user config from %s: %s", user_config_path, e)
+
+    # 4. Apply environment variable overrides
     config_data = apply_env_overrides(config_data)
 
     return config_data
@@ -674,6 +649,12 @@ class TrayApp:
         self.port = port
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+
+        # Set window icon globally for taskbar and dialog headers
+        icon_path = os.path.join(get_root_dir(), "trayprint.ico")
+        if os.path.exists(icon_path):
+            self.app.setWindowIcon(QIcon(icon_path))
+            log.info("Loaded global window icon: %s", icon_path)
 
         # macOS-specific: high-DPI pixmap support
         if sys.platform == 'darwin':
@@ -1041,8 +1022,13 @@ class TrayApp:
     def restart_app(self):
         log.info("User requested restart")
         QCoreApplication.quit()
-        # Give it a moment to cleanup
-        os.execl(sys.executable, sys.executable, *sys.argv)
+        # Spawn a new process of the current executable in a clean environment
+        # by removing PyInstaller's _MEIPASS to force a fresh unpack directory.
+        env = os.environ.copy()
+        env.pop('_MEIPASS', None)
+        subprocess.Popen([sys.executable] + sys.argv[1:], env=env, shell=False)
+        # Terminate the current process immediately
+        sys.exit(0)
 
     def quit_app(self):
         log.info("User requested exit")

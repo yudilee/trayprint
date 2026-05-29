@@ -35,3 +35,9 @@ Thumbs.db
 installer/TrayPrint-3.0.0.msi
 installer/TrayPrint-3.0.0.wixpdb
 installer/TrayPrint.wixobj
+
+# Databases & Egg-info
+*.db
+TrayPrint.egg-info/
+TrayPrint.egg-info
+.pytest_cache/

@@ -5,6 +5,8 @@ Stores recent desktop notifications in memory (max 50) and provides
 a QDialog to browse them in reverse chronological order.
 """
 
+import os
+import json
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QPainter
 
+from path_utils import get_data_dir
 from theme import get_stylesheet, get_palette
 
 
@@ -103,7 +106,16 @@ class NotificationHistoryDialog(QDialog):
         self.setMinimumSize(500, 400)
         self.resize(520, 420)
 
+        # Load settings theme dynamically
         self._theme_id = 'dark'
+        config_path = os.path.join(get_data_dir(), 'config.json')
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self._theme_id = config.get('theme', 'dark')
+            except Exception:
+                pass
         self._theme = get_palette(self._theme_id)
 
         layout = QVBoxLayout(self)
@@ -135,11 +147,12 @@ class NotificationHistoryDialog(QDialog):
             "QPushButton:hover {"
             "  background: %s;"
             "}"
-        ) % (
-            self._theme['bg'],
-            self._theme['error'],
-            self._theme['error'],
-            '#3a2020',
+            % (
+                self._theme['bg'],
+                self._theme['error'],
+                self._theme['error'],
+                '#3a2020' if self._theme_id == 'dark' else '#f8d7da',
+            )
         )
         self.btn_clear.clicked.connect(self._on_clear)
         header_layout.addWidget(self.btn_clear)

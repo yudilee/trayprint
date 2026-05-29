@@ -1,24 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/2006/util">
   <!--
     TrayPrint — WiX Toolset v3.x Installer Definition
 
     Install directory: %ProgramFiles%\PrintHub\TrayPrint
+
     Features:
       - Main executable and config
       - Start Menu shortcut
       - Desktop shortcut (optional)
       - Auto-start via HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-      - Uninstaller support via Windows Installer
+      - Scheduled Task registration/unregistration (runs as SYSTEM)
+      - Silent deployment with MSI public properties
       - Major upgrade support
 
     Build with:
-      candle.exe -dVersion=3.0.0 trayprint.wxs
-      light.exe -out TrayPrint.msi trayprint.wixobj
+      candle.exe -ext WixUtilExtension -dVersion=3.0.0 trayprint.wxs
+      light.exe -ext WixUtilExtension -ext WixUIExtension -out TrayPrint.msi trayprint.wixobj
 
     Prerequisites:
       - WiX Toolset v3.14 or later (https://wixtoolset.org)
       - Built TrayPrint executable (dist\trayprint.exe) from PyInstaller
+      - config.json at project root
+      - trayprint.ico at project root
+      - Register-TrayPrintTask.ps1 and Unregister-TrayPrintTask.ps1 in installer/
+
+    Silent deployment with custom config:
+      msiexec /i TrayPrint.msi HUB_URL=https://hub.example.com AGENT_KEY=mykey SYNC_INTERVAL=120 /quiet
+
+    Public properties for silent deployment:
+      HUB_URL       — URL of the Print Hub server
+      AGENT_KEY     — Agent authentication key
+      SYNC_INTERVAL — Sync interval in seconds (default: 60)
   -->
 
   <Product
@@ -39,12 +53,22 @@
       Manufacturer="Print Hub"
     />
 
+    <!-- Media layout for the MSI CAB file -->
     <Media Id="1" Cabinet="TrayPrint.cab" EmbedCab="yes" CompressionLevel="high" />
 
-    <!-- Require 64-bit Windows -->
+    <!-- The product is a 64-bit application. -->
     <Condition Message="This installer requires a 64-bit version of Windows.">
       VersionNT64
     </Condition>
+
+    <!--
+      ─── MSI Public Properties for Silent Deployment ───
+      These can be set via msiexec command line, e.g.:
+        msiexec /i TrayPrint.msi HUB_URL=https://hub.example.com AGENT_KEY=mykey /quiet
+    -->
+    <Property Id="HUB_URL" Secure="yes" />
+    <Property Id="AGENT_KEY" Secure="yes" />
+    <Property Id="SYNC_INTERVAL" Secure="yes" Value="60" />
 
     <!-- Directory structure: ProgramFiles64Folder\PrintHub\TrayPrint -->
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -52,13 +76,12 @@
         <Directory Id="PrintHubFolder" Name="PrintHub">
           <Directory Id="APPLICATIONFOLDER" Name="TrayPrint">
 
-            <!-- Main executable component -->
+            <!-- Main executable -->
             <Component Id="C_TrayPrintExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901" Win64="yes">
               <File
                 Id="F_TrayPrintExe"
                 Name="trayprint.exe"
                 Source="..\dist\trayprint.exe"
-                KeyPath="yes"
                 Checksum="yes"
               />
 
@@ -70,9 +93,19 @@
                 WorkingDirectory="APPLICATIONFOLDER"
                 Icon="TrayPrintIcon"
               />
+
+              <!-- Registry key as per-user KeyPath (fixes ICE43 and ICE57) -->
+              <RegistryValue
+                Root="HKCU"
+                Key="Software\PrintHub\TrayPrint"
+                Name="Installed"
+                Type="integer"
+                Value="1"
+                KeyPath="yes"
+              />
             </Component>
 
-            <!-- Configuration file -->
+            <!-- Configuration file (bundled default, updated at install time) -->
             <Component Id="C_ConfigJson" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012" Win64="yes">
               <File
                 Id="F_ConfigJson"
@@ -82,7 +115,27 @@
               />
             </Component>
 
-            <!-- Auto-start registry entry -->
+            <!-- PowerShell script: Register Scheduled Task -->
+            <Component Id="C_RegisterTaskScript" Guid="F6A7B8C9-D0E1-2345-6789-ABCDEF012345" Win64="yes">
+              <File
+                Id="F_RegisterTaskScript"
+                Name="Register-TrayPrintTask.ps1"
+                Source="Register-TrayPrintTask.ps1"
+                KeyPath="yes"
+              />
+            </Component>
+
+            <!-- PowerShell script: Unregister Scheduled Task -->
+            <Component Id="C_UnregisterTaskScript" Guid="A7B8C9D0-E1F2-3456-789A-BCDEF0123456" Win64="yes">
+              <File
+                Id="F_UnregisterTaskScript"
+                Name="Unregister-TrayPrintTask.ps1"
+                Source="Unregister-TrayPrintTask.ps1"
+                KeyPath="yes"
+              />
+            </Component>
+
+            <!-- Auto-start registry entry (HKCU\Run) -->
             <Component Id="C_AutoStartRegistry" Guid="E5F6A7B8-C9D0-1234-EF12-345678901234" Win64="yes">
               <RegistryValue
                 Root="HKCU"
@@ -100,14 +153,26 @@
 
       <!-- Start Menu folder -->
       <Directory Id="ProgramMenuFolder">
-        <Directory Id="ProgramMenuDir" Name="PrintHub" />
+        <Directory Id="ProgramMenuDir" Name="TrayPrint">
+          <Component Id="C_ProgramMenuDir" Guid="E5F6A7B8-C9D0-1234-5678-9ABCDEF01234" Win64="yes">
+            <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" Directory="ProgramMenuDir" />
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\PrintHub\TrayPrint"
+              Name="ProgramMenuDirInstalled"
+              Type="integer"
+              Value="1"
+              KeyPath="yes"
+            />
+          </Component>
+        </Directory>
       </Directory>
 
       <!-- Desktop shortcut folder -->
       <Directory Id="DesktopFolder" />
     </Directory>
 
-    <!-- Desktop shortcut (optional) -->
+    <!-- Desktop shortcut -->
     <DirectoryRef Id="DesktopFolder">
       <Component Id="C_DesktopShortcut" Guid="D4E5F6A7-B8C9-0123-DEF1-234567890123" Win64="yes">
         <Shortcut
@@ -135,12 +200,22 @@
       <ComponentRef Id="C_ConfigJson" />
       <ComponentRef Id="C_AutoStartRegistry" />
       <ComponentRef Id="C_DesktopShortcut" />
+      <ComponentRef Id="C_ProgramMenuDir" />
+      <ComponentRef Id="C_RegisterTaskScript" />
+      <ComponentRef Id="C_UnregisterTaskScript" />
     </Feature>
 
     <!-- Icon reference -->
     <Icon Id="TrayPrintIcon" SourceFile="..\trayprint.ico" />
 
-    <!-- UI — standard WiX MSI dialog set -->
+    <!-- License agreement (GNU GPL v3) — embedded in MSI metadata -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+    <!-- Premium installer branding graphic assets -->
+    <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
+
+    <!-- UI — Minimal dialog set (no license page shown, but license is embedded) -->
     <UIRef Id="WixUI_Minimal" />
 
     <!-- Allow upgrading from previous versions -->
@@ -149,17 +224,100 @@
       Schedule="afterInstallValidate"
     />
 
-    <!-- Custom action to run TrayPrint after installation -->
+    <!--
+      ─── Launch Application After Install ───
+      Launch trayprint.exe after install using WixShellExec.
+      Works reliably with WixUI_Minimal (no ICE errors).
+    -->
     <CustomAction
       Id="LaunchApplication"
-      FileKey="F_TrayPrintExe"
-      ExeCommand=""
+      BinaryKey="WixCA"
+      DllEntry="WixShellExec"
       Execute="immediate"
-      Return="asyncNoWait"
+      Return="ignore"
+      Impersonate="yes"
+    />
+    <CustomAction
+      Id="LaunchApplication_SetProperty"
+      Property="WixShellExecTarget"
+      Value="[APPLICATIONFOLDER]trayprint.exe"
+    />
+
+    <!--
+      ─── Scheduled Task Custom Actions ───
+      Uses WixQuietExec (from WixUtilExtension) to run PowerShell scripts
+      silently during install / uninstall with SYSTEM privileges.
+    -->
+
+    <!-- Register Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <CustomAction
+      Id="RegisterScheduledTask"
+      BinaryKey="WixCA"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore"
+    />
+    <CustomAction
+      Id="RegisterScheduledTask_SetProperty"
+      Property="RegisterScheduledTask"
+      Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File [APPLICATIONFOLDER]Register-TrayPrintTask.ps1 -InstallPath [APPLICATIONFOLDER]"
+    />
+
+    <!-- Unregister Scheduled Task (deferred, no impersonation — runs as SYSTEM) -->
+    <CustomAction
+      Id="UnregisterScheduledTask"
+      BinaryKey="WixCA"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore"
+    />
+    <CustomAction
+      Id="UnregisterScheduledTask_SetProperty"
+      Property="UnregisterScheduledTask"
+      Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File [APPLICATIONFOLDER]Unregister-TrayPrintTask.ps1"
+    />
+
+    <!--
+      ─── Update config.json with MSI Properties ───
+      Reads HUB_URL, AGENT_KEY, SYNC_INTERVAL public properties and writes
+      them into the installed config.json. Runs deferred (SYSTEM) so it can
+      write to [APPLICATIONFOLDER].
+
+      Uses only single-quoted strings in the PowerShell command so no XML
+      escaping of double-quotes is needed.
+    -->
+    <CustomAction
+      Id="UpdateConfig"
+      BinaryKey="WixCA"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore"
+    />
+    <CustomAction
+      Id="UpdateConfig_SetProperty"
+      Property="UpdateConfig"
+      Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -Command $cfg = Get-Content '[APPLICATIONFOLDER]config.json' -Raw | ConvertFrom-Json; if ('[HUB_URL]' -ne '') { $cfg.hub_url = '[HUB_URL]' }; if ('[AGENT_KEY]' -ne '') { $cfg.agent_key = '[AGENT_KEY]' }; if ('[SYNC_INTERVAL]' -ne '') { $cfg.sync_interval = [int]'[SYNC_INTERVAL]' }; $cfg | ConvertTo-Json -Depth 10 | Set-Content '[APPLICATIONFOLDER]config.json'"
     />
 
     <InstallExecuteSequence>
-      <Custom Action="LaunchApplication" After="InstallFinalize">NOT Installed</Custom>
+      <!-- Update config.json with MSI properties after files are installed -->
+      <Custom Action="UpdateConfig_SetProperty" After="InstallFiles">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="UpdateConfig" After="UpdateConfig_SetProperty">NOT Installed AND NOT REMOVE</Custom>
+
+      <!-- Schedule task registration AFTER config is updated -->
+      <Custom Action="RegisterScheduledTask_SetProperty" After="UpdateConfig">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="RegisterScheduledTask" After="RegisterScheduledTask_SetProperty">NOT Installed AND NOT REMOVE</Custom>
+
+      <!-- Schedule task unregistration BEFORE files are removed -->
+      <Custom Action="UnregisterScheduledTask_SetProperty" After="InstallInitialize">REMOVE</Custom>
+      <Custom Action="UnregisterScheduledTask" After="UnregisterScheduledTask_SetProperty">REMOVE</Custom>
+
+      <!-- Launch application as current user after install completes -->
+      <Custom Action="LaunchApplication_SetProperty" After="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="LaunchApplication" After="LaunchApplication_SetProperty">NOT Installed</Custom>
     </InstallExecuteSequence>
   </Product>
 </Wix>

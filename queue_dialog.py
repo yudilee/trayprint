@@ -5,6 +5,8 @@ Shows active/pending/recent print jobs in a QTableWidget with
 Cancel, Refresh, and auto-refresh via QTimer.
 """
 
+import os
+import json
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 
+from path_utils import get_data_dir
 from theme import get_stylesheet, get_palette
 
 
@@ -36,7 +39,16 @@ class PrintQueueDialog(QDialog):
         self.setMinimumSize(800, 500)
         self.resize(800, 500)
 
+        # Load settings theme dynamically
         self._theme_id = 'dark'
+        config_path = os.path.join(get_data_dir(), 'config.json')
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self._theme_id = config.get('theme', 'dark')
+            except Exception:
+                pass
         self._theme = get_palette(self._theme_id)
 
         self._refresh_timer = QTimer(self)
@@ -204,7 +216,7 @@ class PrintQueueDialog(QDialog):
                     self._theme['bg'],       # bg for cancel (error-toned)
                     self._theme['error'],     # border
                     self._theme['error'],     # text
-                    '#3a2020',                # hover (slightly lighter red)
+                    '#3a2020' if self._theme_id == 'dark' else '#f8d7da', # hover (slightly lighter red)
                     self._theme['bg'],        # disabled bg
                     self._theme['text_muted'],# disabled text
                     self._theme['border'],    # disabled border

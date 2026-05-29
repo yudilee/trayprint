@@ -137,6 +137,8 @@ def build():
         '--windowed',
         '--name', 'trayprint',
         '--clean',
+        '--collect-all=charset_normalizer',
+        '--collect-all=chardet',
     ] + icon_opt + hidden_imports + datas + binaries + [
         'app.py'
     ]

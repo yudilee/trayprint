@@ -19,6 +19,19 @@ from datetime import datetime
 from collections import OrderedDict
 import threading
 
+# ── Helper: suppress console window for subprocesses on Windows ──
+if sys.platform == 'win32':
+    import subprocess as _sp
+    _BASE_SPAWN = _sp.CREATE_NO_WINDOW if hasattr(_sp, 'CREATE_NO_WINDOW') else 0
+else:
+    _BASE_SPAWN = 0
+
+def _run_hidden(args, **kwargs):
+    """Run a subprocess without showing a console window (Windows only)."""
+    kwargs.setdefault('creationflags', 0)
+    kwargs['creationflags'] |= _BASE_SPAWN
+    return subprocess.run(args, **kwargs)
+
 start_time = time.time()
 
 import printer
@@ -50,17 +63,47 @@ except ImportError:
     log.info("psutil not available — memory/disk monitoring will use fallback methods")
 
 # ─────────────────────────────────────────────
+#  Shared Config Loading (merged from both locations)
+# ─────────────────────────────────────────────
+
+def _load_config():
+    """Load config.json merging from install dir first, then user data dir.
+
+    When installed via MSI (frozen):
+      - Bundled config is at get_root_dir()         → C:\\Program Files\\PrintHub\\TrayPrint\\config.json
+      - User settings are saved to get_data_dir()  → %LOCALAPPDATA%\\TrayPrint\\config.json
+
+    This ensures that user settings saved via the Settings UI take precedence
+    and override the installation-wide defaults.
+    """
+    config = {}
+    # Install dir as fallback (bundled defaults)
+    install_config = os.path.join(get_root_dir(), 'config.json')
+    if os.path.exists(install_config):
+        try:
+            with open(install_config, 'r') as f:
+                config.update(json.load(f))
+        except Exception as e:
+            log.debug("Could not load install config from %s: %s", install_config, e)
+    # User data dir takes priority (where Settings UI saves)
+    user_config = os.path.join(get_data_dir(), 'config.json')
+    if os.path.exists(user_config):
+        try:
+            with open(user_config, 'r') as f:
+                config.update(json.load(f))
+        except Exception as e:
+            log.debug("Could not load user config from %s: %s", user_config, e)
+    return config
+
+# ─────────────────────────────────────────────
 #  Printer Config Merge Support
 # ─────────────────────────────────────────────
 
 def load_printer_configs():
-    """Load per-printer saved configs from config.json."""
-    config_path = os.path.join(get_root_dir(), 'config.json')
+    """Load per-printer saved configs from config.json (merged from both locations)."""
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-                return data.get('printer_configs', {})
+        data = _load_config()
+        return data.get('printer_configs', {})
     except Exception as e:
         log.error("Error loading printer configs: %s", e)
     return {}
@@ -391,15 +434,12 @@ _allowed_origins = ["http://127.0.0.1:*", "http://localhost:*"]
 _profiles = {}
 
 def load_profiles_from_config():
-    """Load profiles from config.json."""
+    """Load profiles from config.json (merged from both locations)."""
     global _profiles
-    config_path = os.path.join(get_root_dir(), 'config.json')
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-                _profiles = data.get('profiles', {})
-                log.info("Loaded %d queue(s) from config", len(_profiles))
+        data = _load_config()
+        _profiles = data.get('profiles', {})
+        log.info("Loaded %d queue(s) from config", len(_profiles))
     except Exception as e:
         log.error("Error loading profiles: %s", e)
 
@@ -919,19 +959,25 @@ def _flush_offline_jobs(hub_url, agent_key):
 def test_hub_connection():
     """Test if the configured hub is reachable. Returns True/False."""
     import requests
-    config_path = os.path.join(get_root_dir(), 'config.json')
+    # Use get_data_dir() to match where the Settings UI saves config.json,
+    # and also fall back to get_root_dir() for the bundled config.
+    config_locations = [
+        os.path.join(get_data_dir(), 'config.json'),
+        os.path.join(get_root_dir(), 'config.json'),
+    ]
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-            hub_url = data.get('hub_url', '').rstrip('/')
-            agent_key = data.get('agent_key', '')
-            if not hub_url or not agent_key:
-                return False
-            headers = {'Authorization': f'Bearer {agent_key}'}
-            resp = requests.get(f'{hub_url}/api/print-hub/heartbeat', headers=headers, timeout=5)
-            return resp.status_code == 200
-        return False
+        data = {}
+        for config_path in config_locations:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    data.update(json.load(f))
+        hub_url = data.get('hub_url', '').rstrip('/')
+        agent_key = data.get('agent_key', '')
+        if not hub_url or not agent_key:
+            return False
+        headers = {'Authorization': f'Bearer {agent_key}'}
+        resp = requests.get(f'{hub_url}/api/print-hub/heartbeat', headers=headers, timeout=5)
+        return resp.status_code == 200
     except Exception as e:
         log.debug("test_hub_connection failed: %s", e)
         return False
@@ -987,18 +1033,15 @@ def get_watchdog_log():
 
 def load_watchdog_checks_config():
     """Load watchdog_checks from config.json, falling back to defaults."""
-    config_path = os.path.join(get_root_dir(), 'config.json')
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-            checks = data.get('watchdog_checks', {})
-            if checks:
-                with _watchdog_checks_lock:
-                    for key in _watchdog_checks_config:
-                        if key in checks:
-                            _watchdog_checks_config[key] = bool(checks[key])
-                log.info("Loaded watchdog checks config: %s", _watchdog_checks_config)
+        data = _load_config()
+        checks = data.get('watchdog_checks', {})
+        if checks:
+            with _watchdog_checks_lock:
+                for key in _watchdog_checks_config:
+                    if key in checks:
+                        _watchdog_checks_config[key] = bool(checks[key])
+            log.info("Loaded watchdog checks config: %s", _watchdog_checks_config)
     except Exception as e:
         log.error("Error loading watchdog checks config: %s", e)
 
@@ -1053,7 +1096,7 @@ class WatchdogThread(threading.Thread):
         except ImportError:
             # Fallback using tasklist
             try:
-                result = subprocess.run(
+                result = _run_hidden(
                     ['tasklist', '/FI', 'IMAGENAME eq spoolsv.exe'],
                     capture_output=True, text=True, timeout=10
                 )
@@ -1328,34 +1371,31 @@ _agent_key = ""
 def reload_config():
     """Re-read config.json and update runtime state without restarting."""
     global _hub_url, _agent_key, _allowed_origins
-    config_path = os.path.join(get_root_dir(), 'config.json')
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-            _hub_url = data.get('hub_url', '')
-            _agent_key = data.get('agent_key', '')
-            if 'allowed_origins' in data:
-                _allowed_origins = data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
-            load_profiles_from_config()
-            load_watchdog_checks_config()
+        data = _load_config()
+        _hub_url = data.get('hub_url', '')
+        _agent_key = data.get('agent_key', '')
+        if 'allowed_origins' in data:
+            _allowed_origins = data.get('allowed_origins', ["http://127.0.0.1:*", "http://localhost:*"])
+        load_profiles_from_config()
+        load_watchdog_checks_config()
 
-            # Update hot-reloadable sync config so new interval/retry values take effect immediately
-            with _sync_config_lock:
-                new_interval = data.get('sync_interval_seconds', _sync_config.get("interval", 60))
-                new_max_retries = data.get('max_retries', _sync_config.get("max_retries", 3))
-                new_retry_delay = data.get('retry_delay_seconds', _sync_config.get("retry_delay", 60))
-                _sync_config["interval"] = new_interval
-                _sync_config["max_retries"] = new_max_retries
-                _sync_config["retry_delay"] = new_retry_delay
-                log.info("Sync config hot-reloaded: interval=%ds, max_retries=%d, retry_delay=%ds",
-                         new_interval, new_max_retries, new_retry_delay)
+        # Update hot-reloadable sync config so new interval/retry values take effect immediately
+        with _sync_config_lock:
+            new_interval = data.get('sync_interval_seconds', _sync_config.get("interval", 60))
+            new_max_retries = data.get('max_retries', _sync_config.get("max_retries", 3))
+            new_retry_delay = data.get('retry_delay_seconds', _sync_config.get("retry_delay", 60))
+            _sync_config["interval"] = new_interval
+            _sync_config["max_retries"] = new_max_retries
+            _sync_config["retry_delay"] = new_retry_delay
+            log.info("Sync config hot-reloaded: interval=%ds, max_retries=%d, retry_delay=%ds",
+                     new_interval, new_max_retries, new_retry_delay)
 
-            # Signal the sync loop to pick up new interval on next iteration
-            request_queue_refresh()
+        # Signal the sync loop to pick up new interval on next iteration
+        request_queue_refresh()
 
-            log.info("Config reloaded: hub_url=%s, profiles=%d", _hub_url, len(_profiles))
-            return True
+        log.info("Config reloaded: hub_url=%s, profiles=%d", _hub_url, len(_profiles))
+        return True
     except Exception as e:
         log.error("Error reloading config: %s", e)
     return False
@@ -1384,13 +1424,10 @@ def create_app():
     from flask import Flask, request, jsonify, render_template
     app = Flask(__name__, template_folder=get_resource_path('templates'))
 
-    # Load settings
-    config_path = os.path.join(get_root_dir(), 'config.json')
+    # Load settings (merged from both user data dir and install dir)
     config_data = {"port": 49211, "allowed_origins": ["*"]}
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                config_data.update(json.load(f))
+        config_data.update(_load_config())
     except Exception as e:
         log.error("Error loading config.json: %s", e)
 
@@ -1631,16 +1668,7 @@ def create_app():
     @app.route('/api/diagnostics', methods=['GET'])
     def diagnostics():
         """Return full diagnostics data for the TrayPrint agent."""
-        config_path = os.path.join(get_root_dir(), 'config.json')
-        config_exists = os.path.exists(config_path)
-        cfg = {}
-        if config_exists:
-            try:
-                with open(config_path, 'r') as f:
-                    cfg = json.load(f)
-            except Exception:
-                pass
-
+        cfg = _load_config()
         hub_url = cfg.get('hub_url', '')
         printers_list = printer.get_printers()
         queue = _job_queue.list_recent(50)
@@ -1748,8 +1776,6 @@ def create_app():
             "python_version": sys.version,
             "platform": sys.platform,
             "run_mode": "packaged" if getattr(sys, 'frozen', False) else "dev",
-            "config_path": config_path,
-            "config_exists": config_exists,
             "hub_url": hub_url,
             "hub_connected": hub_reachable,
             "hub_reachable": hub_reachable,

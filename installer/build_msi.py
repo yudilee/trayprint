@@ -109,21 +109,63 @@ def build_with_cx_freeze(version, output_dir):
     with open(setup_path, "w") as f:
         f.write(f'''
 import sys
+import os
+# Add project root to sys.path so local modules can be found
+sys.path.insert(0, r"{PROJECT_ROOT}")
 from cx_Freeze import setup, Executable
 
 # Dependencies
 build_exe_options = {{
     "packages": [
-        "os", "sys", "json", "threading", "time", "uuid",
-        "subprocess", "webbrowser", "datetime", "platform",
-        "tempfile", "collections", "re", "socket", "base64",
-        "queue", "logging", "sqlite3",
+        # Local modules
+        "server", "printer", "websocket_client", "autostart", "ui_settings",
+        "path_utils", "logger", "log_utils", "notification_history",
+        "queue_dialog", "diagnostics_dialog", "updater", "theme",
+        "capabilities", "service", "platform_darwin",
+        # Stdlib
+        "os", "sys", "json", "threading", "subprocess", "time", "re",
+        "pathlib", "shutil", "uuid", "datetime", "socket", "urllib",
+        "http", "email", "base64", "hashlib", "hmac", "textwrap",
+        "math", "functools", "inspect", "itertools", "collections",
+        "typing", "enum", "dataclasses", "configparser", "argparse",
+        "logging", "warnings", "traceback", "queue", "copy", "glob",
+        "tempfile", "io", "struct", "binascii",
+        # Third-party
+        "PySide6", "flask", "flask_cors", "requests", "pystray",
+        "PIL", "win32print", "win32con", "win32api", "win32ui",
+        "pythoncom", "websockets",
     ],
-    "excludes": ["tkinter", "test", "unittest"],
+    "includes": [
+        "server", "printer", "websocket_client", "autostart", "ui_settings",
+        "path_utils", "logger", "log_utils", "notification_history",
+        "queue_dialog", "diagnostics_dialog", "updater", "theme",
+        "capabilities", "service",
+    ],
+    "excludes": [
+        "tkinter", "test", "unittest", "distutils", "ensurepip", "venv",
+        "numpy", "scipy", "matplotlib", "pandas", "sympy", "sklearn",
+        "tensorflow", "torch", "cv2",
+        "PySide6.Qt3DAnimation", "PySide6.Qt3DCore", "PySide6.Qt3DExtras",
+        "PySide6.Qt3DInput", "PySide6.Qt3DLogic", "PySide6.Qt3DRender",
+        "PySide6.QtBluetooth", "PySide6.QtCanvas3D",
+        "PySide6.QtHelp", "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
+        "PySide6.QtNfc", "PySide6.QtPositioning", "PySide6.QtQml",
+        "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQuickControls2",
+        "PySide6.QtQuickWidgets", "PySide6.QtRemoteObjects",
+        "PySide6.QtScxml", "PySide6.QtSensors", "PySide6.QtSerialPort",
+        "PySide6.QtSpeech", "PySide6.QtSql", "PySide6.QtSvgWidgets",
+        "PySide6.QtTest", "PySide6.QtTextToSpeech",
+        "PySide6.QtWebChannel", "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineQuick", "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebSockets", "PySide6.QtXml", "PySide6.QtXmlPatterns",
+        "PySide6.QtDBus",
+    ],
     "include_files": [
         ("{os.path.join(PROJECT_ROOT, 'templates').replace(chr(92), '/')}", "templates"),
         ("{os.path.join(PROJECT_ROOT, 'config.json').replace(chr(92), '/')}", "config.json"),
     ],
+    "zip_include_packages": ["*"],
+    "zip_exclude_packages": [],
 }}
 
 # GUI executable (no console window)
@@ -139,7 +181,13 @@ setup(
     version="{version}",
     description="TrayPrint - Local Print Agent for Print Hub",
     author="Print Hub",
-    options={{"build_exe": build_exe_options}},
+    options={{
+        "build_exe": build_exe_options,
+        "bdist_msi": {{
+            "initial_target_dir": r"[ProgramFiles64Folder]\PrintHub\TrayPrint",
+            "all_users": True,
+        }},
+    }},
     executables=[gui_exe],
 )
 ''')
@@ -171,6 +219,7 @@ setup(
     dst = os.path.join(output_dir, f"TrayPrint-{version}.msi")
     shutil.copy2(src, dst)
     print(f"\n[SUCCESS] MSI installer created: {dst}")
+
     return dst
 
 
@@ -254,14 +303,24 @@ exe = EXE(
     # Locate WiX tools
     candle = "candle.exe"
     light = "light.exe"
-    wix_path = os.environ.get("WIX", "")
-    if wix_path:
-        candle = os.path.join(wix_path, "candle.exe")
-        light = os.path.join(wix_path, "light.exe")
+    wix_path = os.environ.get("WIX", "").strip().rstrip("\\")
+    if wix_path and os.path.isdir(wix_path):
+        candle = os.path.join(wix_path, "bin", "candle.exe")
+        light = os.path.join(wix_path, "bin", "light.exe")
+    else:
+        # Try common WiX locations
+        for p in [
+            r"C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            r"C:\Program Files\WiX Toolset v3.14\bin",
+        ]:
+            if os.path.exists(os.path.join(p, "candle.exe")):
+                candle = os.path.join(p, "candle.exe")
+                light = os.path.join(p, "light.exe")
+                break
 
     # Compile .wxs -> .wixobj
     result = subprocess.run(
-        [candle, "-dVersion=%s" % version, wxs_path, "-out", wixobj_path],
+        [candle, "-ext", "WixUtilExtension", "-dVersion=%s" % version, wxs_path, "-out", wixobj_path],
         capture_output=False,
     )
     if result.returncode != 0:
@@ -271,7 +330,7 @@ exe = EXE(
     # Link .wixobj -> .msi
     os.makedirs(output_dir, exist_ok=True)
     result = subprocess.run(
-        [light, "-out", msi_path, wixobj_path],
+        [light, "-ext", "WixUtilExtension", "-ext", "WixUIExtension", "-out", msi_path, wixobj_path],
         capture_output=False,
     )
     if result.returncode != 0:
@@ -283,6 +342,7 @@ exe = EXE(
         os.remove(wixobj_path)
 
     print(f"\n[SUCCESS] MSI installer created: {msi_path}")
+
     return msi_path
 
 
@@ -316,10 +376,11 @@ def main():
 
     builder = args.builder
     if builder == "auto":
-        if has_cx:
-            builder = "cx_freeze"
-        elif has_py and has_wix:
+        # Prefer PyInstaller + WiX for smaller size, no console flash, and auto-launch
+        if has_py and has_wix:
             builder = "pyinstaller"
+        elif has_cx:
+            builder = "cx_freeze"
         else:
             print("[ERROR] No suitable build backend found.")
             print("  Install cx_Freeze: pip install cx_Freeze")
