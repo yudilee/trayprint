@@ -1032,12 +1032,23 @@ def _create_devmode_for_options(printer_name, options):
                     devmode.PaperLength = int(float(h_mm) * 10)
                     devmode.Fields |= (win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH)
 
-                # CLEAR orientation flag — let the form shape control layout
-                devmode.Fields &= ~win32con.DM_ORIENTATION
+                if orientation == 'landscape':
+                    devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                    devmode.Fields |= win32con.DM_ORIENTATION
+                    log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d, Orientation=LANDSCAPE",
+                             paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
+                elif orientation == 'portrait':
+                    devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                    devmode.Fields |= win32con.DM_ORIENTATION
+                    log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d, Orientation=PORTRAIT",
+                             paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
+                else:
+                    # CLEAR orientation flag — let the form shape control layout
+                    devmode.Fields &= ~win32con.DM_ORIENTATION
+                    log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d — orientation flag cleared",
+                             paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
 
                 modified = True
-                log.info("DevMode: PaperSize=%d (%s), W=%d, H=%d — orientation flag cleared",
-                         paper_id, paper_name, devmode.PaperWidth, devmode.PaperLength)
             else:
                 if w_mm and h_mm:
                     # No matching form found — use DMPAPER_USER with explicit dimensions
@@ -1238,13 +1249,17 @@ def _print_pdf_windows(printer_name, pdf_path, options):
         original_devmode = None
         hprinter = None
         if devmode:
+            # Set copies to 1 in DevMode since GDI printing manually loops to render copies
+            devmode.Copies = 1
+            devmode.Fields |= win32con.DM_COPIES
+            
             hprinter = win32print.OpenPrinter(printer_name,
                 {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
             pinfo = win32print.GetPrinter(hprinter, 2)
             original_devmode = pinfo['pDevMode']
             pinfo['pDevMode'] = devmode
             win32print.SetPrinter(hprinter, 2, pinfo, 0)
-            log.info("GDI: printer default set to paper=%s (ID=%s)", paper_name,
+            log.info("GDI: printer default set to paper=%s (ID=%s), copies set to 1 in devmode", paper_name,
                      devmode.PaperSize if devmode else None)
 
         try:

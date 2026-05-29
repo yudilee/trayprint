@@ -611,7 +611,19 @@ def _check_instance_lock():
             with open(pid_path, 'r') as f:
                 old_pid = int(f.read().strip())
             # Check if the process with this PID is still alive
-            if os.path.exists(f'/proc/{old_pid}'):
+            pid_exists = False
+            if sys.platform == 'win32':
+                import errno
+                try:
+                    os.kill(old_pid, 0)
+                    pid_exists = True
+                except OSError as err:
+                    # EPERM means process exists but we don't have permission to signal it
+                    pid_exists = (err.errno == errno.EPERM)
+            else:
+                pid_exists = os.path.exists(f'/proc/{old_pid}')
+
+            if pid_exists:
                 log.warning("Another TrayPrint instance is already running (PID %d exists)", old_pid)
                 return False
             else:
