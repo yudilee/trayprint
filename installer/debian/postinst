@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# TrayPrint — Debian package post-installation script
+#
+set -e
+
+INSTALL_DIR="/usr/lib/trayprint"
+
+case "$1" in
+    configure)
+        # Update desktop database
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database 2>/dev/null || true
+        fi
+
+        # Update icon cache
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+        fi
+
+        # Enable and start systemd user service for all existing users
+        if command -v systemctl >/dev/null 2>&1; then
+            # Enable user service globally (will be started by each user on login)
+            systemctl --global enable trayprint.service 2>/dev/null || true
+            echo "TrayPrint systemd user service enabled globally."
+        fi
+
+        echo ""
+        echo "  TrayPrint v3.0.0 installed successfully!"
+        echo ""
+        echo "  To start TrayPrint in GUI mode:"
+        echo "    Run 'trayprint' from the application menu or terminal"
+        echo ""
+        echo "  To start in headless service mode (current user):"
+        echo "    systemctl --user start trayprint.service"
+        echo "    systemctl --user enable trayprint.service"
+        echo ""
+        echo "  Configuration: /etc/trayprint/config.json"
+        echo "  Logs:          ~/.local/share/trayprint/logs/"
+        echo ""
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        exit 0
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

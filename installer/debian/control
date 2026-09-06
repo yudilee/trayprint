@@ -1,0 +1,31 @@
+Package: trayprint
+Version: 3.0.0-1
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: cups,
+         python3 (>= 3.10),
+         python3-pyside6 (>= 6.5),
+         python3-flask (>= 3.0),
+         python3-requests,
+         python3-pil,
+         python3-websockets (>= 14.0),
+         python3-packaging,
+         libglib2.0-0,
+         libxkbcommon0
+Recommends: desktop-file-utils
+Maintainer: Print Hub Team <support@print-hub.example.com>
+Homepage: https://print-hub.example.com
+Description: Local Print Agent for Print Hub
+ TrayPrint is a system tray application that connects printers
+ to your enterprise print management system. It runs in the
+ background, automatically discovers printers via CUPS, and
+ processes print jobs from Print Hub.
+ .
+ Features:
+  - System tray GUI with dark/light theme support
+  - Automatic printer discovery via CUPS
+  - Real-time job queue with WebSocket updates
+  - Per-printer configuration with capability discovery
+  - Headless server mode for service deployment
+  - Auto-update with SHA-256 verification

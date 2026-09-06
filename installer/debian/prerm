@@ -1,0 +1,38 @@
+#!/bin/bash
+#
+# TrayPrint — Debian package pre-removal script
+#
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+
+        # Stop and disable systemd user service for all users
+        if command -v systemctl >/dev/null 2>&1; then
+            # For each logged-in user, stop the service
+            for session in /run/user/*; do
+                uid="${session##*/}"
+                if [ -n "$uid" ] && [ "$uid" != "0" ]; then
+                    systemctl --machine="$uid@" --user stop trayprint.service 2>/dev/null || true
+                fi
+            done
+
+            # Disable global user service
+            systemctl --global disable trayprint.service 2>/dev/null || true
+        fi
+
+        echo "TrayPrint service stopped and disabled."
+        ;;
+
+    failed-upgrade)
+        exit 0
+        ;;
+
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+exit 0
