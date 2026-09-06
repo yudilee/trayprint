@@ -44,6 +44,7 @@ jobs:
         run: ls -la dist/ | grep -iE '\.exe$' && file dist/*.exe || true
 
       - name: Publish release ke Print Hub (jika secret HUB_RELEASE_URL di-set)
+        continue-on-error: true
         shell: bash
         env:
           HUB_URL: ${{ secrets.HUB_RELEASE_URL }}
