@@ -1806,3 +1806,38 @@ def print_pdf(printer_name, pdf_base64, options=None):
 if __name__ == '__main__':
     printers = get_printers()
     print("Available Printers:", printers)
+
+
+def get_printer_hardware_status(printer_name: str) -> dict:
+    """
+    Returns normalized hardware status dictionary for telemetry:
+    {'state': 'ready'|'paper_out'|'paper_jam'|'door_open'|'no_toner'|'low_toner'|'offline'|'error', 'message': str}
+    """
+    if not is_windows() or not win32print:
+        return {'state': 'ready', 'message': 'Online'}
+
+    try:
+        h = win32print.OpenPrinter(printer_name)
+        info = win32print.GetPrinter(h, 2)
+        win32print.ClosePrinter(h)
+        status_bits = info.get('Status', 0)
+
+        if status_bits == 0:
+            return {'state': 'ready', 'message': 'Ready'}
+        if status_bits & 128:
+            return {'state': 'offline', 'message': 'Printer offline'}
+        if status_bits & 4194304:
+            return {'state': 'door_open', 'message': 'Door or cover open'}
+        if status_bits & 16:
+            return {'state': 'paper_out', 'message': 'Out of paper'}
+        if status_bits & 8:
+            return {'state': 'paper_jam', 'message': 'Paper jam'}
+        if status_bits & 262144:
+            return {'state': 'no_toner', 'message': 'No toner'}
+        if status_bits & 131072:
+            return {'state': 'low_toner', 'message': 'Toner low'}
+        if status_bits & 2:
+            return {'state': 'error', 'message': 'General printer error'}
+        return {'state': 'ready', 'message': f'Status code {status_bits}'}
+    except Exception as e:
+        return {'state': 'error', 'message': str(e)}

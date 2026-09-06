@@ -1,0 +1,27 @@
+#!/bin/bash
+#
+# TrayPrint — AppImage entry-point script
+#
+# This script is the entry point for the AppImage runtime.
+# It resolves the AppDir path and launches the bundled PyInstaller executable.
+#
+
+set -eu
+
+# Resolve the AppDir root directory (where this script lives)
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# Path to the bundled executable
+EXECUTABLE="$APPDIR/usr/bin/trayprint"
+
+if [ ! -x "$EXECUTABLE" ]; then
+    echo "ERROR: TrayPrint executable not found at $EXECUTABLE" >&2
+    echo "The AppImage may be corrupted. Please re-download." >&2
+    exit 1
+fi
+
+# Export AppDir so the launcher can find bundled resources if needed
+export APPDIR
+
+# Launch the executable, passing through all command-line arguments
+exec "$EXECUTABLE" "$@"

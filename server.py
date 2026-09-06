@@ -827,7 +827,7 @@ def start_hub_sync(hub_url, agent_key, interval, max_retries=3, retry_delay=60):
     log.info("Hub sync & spooler started → %s (every %ds)", hub_url, interval)
 
 def report_status_to_hub(hub_url, agent_key):
-    """Report local status (printers + capabilities) to the central hub."""
+    """Report local status (printers + capabilities + hardware telemetry) to the central hub."""
     import requests
     if not hub_url:
         return
@@ -839,8 +839,9 @@ def report_status_to_hub(hub_url, agent_key):
         global _cached_printer_count
         _cached_printer_count = len(printers_list)
 
-        # Build capabilities for each printer (fire-and-forget discovery on each report)
+        # Build capabilities & hardware status for each printer
         capabilities_dict = {}
+        hardware_status_dict = {}
         try:
             import capabilities as caps_mod
             for p in printers_list:
@@ -852,26 +853,40 @@ def report_status_to_hub(hub_url, agent_key):
                             capabilities_dict[name] = caps
                     except Exception:
                         pass
+                    try:
+                        if hasattr(printer, 'get_printer_hardware_status'):
+                            hardware_status_dict[name] = printer.get_printer_hardware_status(name)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
         payload = {
             'printers': [p['name'] for p in printers_list],
             'capabilities': capabilities_dict,
+            'hardware_status': hardware_status_dict,
         }
-        resp = requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
+        
+        # Post to telemetry endpoint (syncs printers, capabilities and hardware health)
+        resp = requests.post(f'{hub_url}/api/print-hub/telemetry', json=payload, headers=headers, timeout=10)
         global _hub_last_status
         if resp.status_code == 200:
             json_data = resp.json()
-            data = _check_hub_response(json_data, "status report")
+            data = _check_hub_response(json_data, "telemetry report")
             if data is not None:
                 _hub_last_status = "Connected"
-                log.info("Reported %d printers (+ capabilities) to hub", len(printers_list))
+                log.info("Reported %d printers (+ capabilities & telemetry) to hub", len(printers_list))
             else:
                 _hub_last_status = "Offline (API error)"
         else:
-            _hub_last_status = f"Offline ({resp.status_code})"
-            log.warning("Hub rejected status report (HTTP %d): %s", resp.status_code, resp.text)
+            # Fallback to legacy status endpoint if telemetry returned 404
+            if resp.status_code == 404:
+                resp = requests.post(f'{hub_url}/api/print-hub/status', json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                _hub_last_status = "Connected"
+            else:
+                _hub_last_status = f"Offline ({resp.status_code})"
+                log.warning("Hub rejected status report (HTTP %d): %s", resp.status_code, resp.text)
     except Exception as e:
         _hub_last_status = "Offline"
         log.debug("Failed to report status to hub: %s", e)

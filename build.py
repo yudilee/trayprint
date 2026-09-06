@@ -3,6 +3,80 @@ import sys
 import subprocess
 import shutil
 
+# ── Helper: generate a PNG icon from trayprint.ico (Linux) ──
+
+def _generate_png_icon(png_path, size=256):
+    """
+    Generate a PNG icon from the existing trayprint.ico using Pillow.
+    Falls back to creating a simple programmatic icon if Pillow is unavailable
+    or the .ico file doesn't exist.
+    """
+    from PIL import Image, ImageDraw
+
+    ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trayprint.ico')
+
+    # Try to load the .ico and convert to PNG
+    if os.path.exists(ico_path):
+        try:
+            img = Image.open(ico_path)
+            # Pick the largest available size
+            if hasattr(img, 'n_frames') and img.n_frames > 1:
+                best = max(range(img.n_frames),
+                           key=lambda i: img.thumbnail((size, size), Image.LANCZOS) or
+                           img if False else 0)
+                img.seek(best)
+            img = img.convert('RGBA')
+            img.thumbnail((size, size), Image.LANCZOS)
+            img.save(png_path, 'PNG')
+            print(f"✓ Generated PNG icon from trayprint.ico → {png_path}")
+            return True
+        except Exception as e:
+            print(f"! Could not convert .ico to PNG: {e}")
+            # Fall through to programmatic icon
+
+    # Programmatic fallback: draw a simple printer icon
+    print("! Creating programmatic printer icon (no trayprint.ico)")
+    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Printer body
+    margin = size // 8
+    body_left = margin
+    body_top = size // 4
+    body_right = size - margin
+    body_bottom = size - margin
+    body_height = body_bottom - body_top
+    body_width = body_right - body_left
+
+    # Draw printer body (rounded rect approximation)
+    draw.rectangle([body_left, body_top + body_height // 3, body_right, body_bottom],
+                   fill=(50, 150, 250), outline=(30, 100, 200))
+
+    # Draw paper slot (top)
+    slot_top = body_top + body_height // 6
+    slot_bottom = body_top + body_height // 3
+    draw.rectangle([body_left + body_width // 4, slot_top,
+                    body_right - body_width // 4, slot_bottom],
+                   fill=(255, 255, 255), outline=(200, 200, 200))
+
+    # Draw paper coming out
+    paper_top = body_bottom - body_height // 4
+    draw.rectangle([body_left + body_width // 4, paper_top,
+                    body_right - body_width // 4, body_bottom],
+                   fill=(255, 255, 255), outline=(200, 200, 200))
+
+    # Lines on paper
+    line_y = paper_top + (body_bottom - paper_top) // 3
+    for i in range(3):
+        draw.line([body_left + body_width // 3, line_y + i * 8,
+                   body_right - body_width // 3, line_y + i * 8],
+                  fill=(100, 100, 100), width=2)
+
+    img.save(png_path, 'PNG')
+    print(f"✓ Created programmatic PNG icon → {png_path}")
+    return True
+
+
 def build():
     """Build the tray app into a standalone executable using PyInstaller."""
     print("=" * 50)
@@ -16,6 +90,14 @@ def build():
     except ImportError:
         print("[FAIL] PyInstaller not found. Installing...")
         subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
+
+    # On Linux, ensure Pillow is available for icon generation
+    if sys.platform.startswith('linux'):
+        try:
+            import PIL
+        except ImportError:
+            print("[INFO] Pillow not found — installing for icon generation...")
+            subprocess.run([sys.executable, '-m', 'pip', 'install', 'Pillow'], check=True)
 
     # Check pywin32 (critical for Windows)
     if sys.platform == 'win32':
@@ -87,7 +169,7 @@ def build():
         '--hidden-import=contextlib',
         '--hidden-import=collections',
     ]
-    
+
     if sys.platform == 'win32':
         icon_path = os.path.join(app_dir, 'trayprint.ico')
         if os.path.exists(icon_path):
@@ -116,13 +198,24 @@ def build():
             '--hidden-import=CoreFoundation',
             '--hidden-import=CoreGraphics',
         ]
+    elif sys.platform.startswith('linux'):
+        # Linux: PNG icon — generate from .ico or create programmatic icon
+        png_path = os.path.join(app_dir, 'installer', 'trayprint.png')
+        if not os.path.exists(png_path):
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+            _generate_png_icon(png_path, size=256)
+        if os.path.exists(png_path):
+            icon_opt = ['--icon', png_path]
+            print(f"✓ Using PNG icon: {png_path}")
+        else:
+            print("! No PNG icon available — will use default")
 
     # Data files to include inside the bundle (read-only templates/icons)
     datas = [
         f'--add-data=config.json{os.pathsep}.',
         f'--add-data=templates{os.pathsep}templates',
     ]
-    
+
     binaries = []
 
     # On Windows, include SumatraPDF if present
@@ -131,15 +224,23 @@ def build():
         datas.append(f'--add-data=SumatraPDF.exe{os.pathsep}.')
         print("✓ SumatraPDF.exe will be bundled")
 
-    cmd = [
-        sys.executable, '-m', 'PyInstaller',
+    # Base PyInstaller flags (common to all platforms)
+    pyinstaller_flags = [
         '--onefile',
-        '--windowed',
         '--name', 'trayprint',
         '--clean',
         '--collect-all=charset_normalizer',
         '--collect-all=chardet',
-    ] + icon_opt + hidden_imports + datas + binaries + [
+    ]
+
+    # --windowed is Windows/macOS only; on Linux it suppresses the console
+    # which is not the intended behavior (we want stderr visible for diagnostics)
+    if sys.platform in ('win32', 'darwin'):
+        pyinstaller_flags.append('--windowed')
+
+    cmd = [
+        sys.executable, '-m', 'PyInstaller',
+    ] + pyinstaller_flags + icon_opt + hidden_imports + datas + binaries + [
         'app.py'
     ]
 
@@ -163,7 +264,17 @@ def build():
         print(f"  Size:   {size_mb:.1f} MB")
         print(f"{'=' * 50}")
     else:
-        print("\n✗ Build failed — executable not found.")
+        # On Linux with --onefile, PyInstaller may place it as 'trayprint' in dist/
+        alt_path = os.path.join(dist_dir, 'trayprint')
+        if os.path.exists(alt_path):
+            size_mb = os.path.getsize(alt_path) / (1024 * 1024)
+            print(f"\n{'=' * 50}")
+            print(f"  BUILD SUCCESS!")
+            print(f"  Output: {alt_path}")
+            print(f"  Size:   {size_mb:.1f} MB")
+            print(f"{'=' * 50}")
+        else:
+            print("\n✗ Build failed — executable not found.")
 
 
 if __name__ == '__main__':

@@ -41,3 +41,6 @@ installer/TrayPrint.wixobj
 TrayPrint.egg-info/
 TrayPrint.egg-info
 .pytest_cache/
+
+# graphify output
+/graphify-out/

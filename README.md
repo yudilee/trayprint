@@ -112,16 +112,6 @@ cp config.json config.json  # Edit hub_url and agent_key
 python app.py
 ```
 
-### Production (Packaged Build)
-
-```bash
-# Build with PyInstaller
-pip install pyinstaller
-python build.py
-
-# The built executable will be in dist/TrayPrint/
-```
-
 ### MSI Installer (Windows)
 
 ```bash
@@ -130,6 +120,61 @@ cd installer
 build_msi.bat
 # Output: installer/TrayPrint.msi
 ```
+
+### Linux Installer (AppImage / .deb / .rpm)
+
+TrayPrint supports three Linux packaging formats — **AppImage** (portable,
+recommended), **.deb** (Debian/Ubuntu), and **.rpm** (Fedora/RHEL).
+
+#### Quick Install (Any Linux)
+
+```bash
+# Download or build the AppImage
+python installer/build_appimage.py
+
+# Run immediately (no installation needed)
+chmod +x dist/TrayPrint-x86_64.AppImage
+./dist/TrayPrint-x86_64.AppImage
+
+# Or install system-wide with the universal installer
+./installer/install.sh
+```
+
+#### Debian/Ubuntu
+
+```bash
+# Build and install .deb package
+./installer/build_deb.sh
+sudo apt install ./dist/trayprint_*.deb
+```
+
+#### Fedora/RHEL
+
+```bash
+# Build and install .rpm package
+./installer/build_rpm.sh
+sudo dnf install ./dist/trayprint-*.rpm
+```
+
+#### Headless / Service Mode
+
+After installation, TrayPrint can run as a systemd user service:
+
+```bash
+# Enable and start the service
+systemctl --user enable trayprint.service
+systemctl --user start trayprint.service
+
+# Check status
+systemctl --user status trayprint.service
+```
+
+#### Prerequisites
+
+- **CUPS** must be installed and running (`sudo systemctl enable cups`)
+- **Python 3.10+** (for .deb/.rpm source packages; AppImage bundles its own runtime)
+- For .deb: `sudo apt install cups`
+- For .rpm: `sudo dnf install cups`
 
 ---
 
