@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.print-hub.trayprint</id>
+  <name>TrayPrint</name>
+  <summary>Local Print Agent for Print Hub</summary>
+  <description>
+    <p>TrayPrint is a system tray application that connects printers to your
+    enterprise print management system. It runs in the background, automatically
+    discovers printers via CUPS, and processes print jobs from Print Hub.</p>
+    <p>Features:</p>
+    <ul>
+      <li>System tray GUI with dark/light theme support</li>
+      <li>Automatic printer discovery via CUPS</li>
+      <li>Real-time job queue with WebSocket updates</li>
+      <li>Per-printer configuration with capability discovery</li>
+      <li>Headless server mode for service deployment</li>
+      <li>Auto-update with SHA-256 verification</li>
+    </ul>
+  </description>
+  <url type="homepage">https://print-hub.example.com</url>
+  <url type="bugtracker">https://github.com/your-org/trayprint/issues</url>
+  <project_license>MIT</project_license>
+  <metadata_license>CC0-1.0</metadata_license>
+
+  <developer_name>Print Hub Team</developer_name>
+
+  <releases>
+    <release version="3.0.0" date="2026-05-29">
+      <description>
+        <p>Initial Linux release with AppImage, DEB, and RPM packaging support.</p>
+      </description>
+    </release>
+  </releases>
+
+  <categories>
+    <category>Utility</category>
+  </categories>
+
+  <keywords>
+    <keyword>print</keyword>
+    <keyword>printer</keyword>
+    <keyword>CUPS</keyword>
+    <keyword>print-agent</keyword>
+    <keyword>system-tray</keyword>
+  </keywords>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>TrayPrint system tray menu</caption>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1" />
+</component>

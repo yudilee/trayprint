@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=TrayPrint
+GenericName=Print Agent
+Comment=Local Print Agent for Print Hub — connects printers to your enterprise print management system
+Exec=trayprint
+Icon=trayprint
+Terminal=false
+Type=Application
+Categories=Utility;Printing;Network;
+StartupNotify=false
+StartupWMClass=TrayPrint
+X-AppImage-Version=3.0.0
+X-AppImage-Name=TrayPrint
