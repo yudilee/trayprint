@@ -1,0 +1,48 @@
+name: macOS Build (DMG)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build .app (PyInstaller)
+        shell: bash
+        run: python build.py
+
+      - name: Build DMG (hdiutil)
+        shell: bash
+        run: |
+          ls -la dist/
+          bash installer/build_dmg.sh --app "dist/trayprint.app" --output "dist/TrayPrint-macos.dmg" || {
+            echo "build_dmg.sh gagal — coba fallback tar.app";
+            ls -d dist/*.app && exit 1 || exit 1;
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trayprint-macos
+          path: |
+            dist/*.dmg
+            dist/*.app
+          if-no-files-found: error
