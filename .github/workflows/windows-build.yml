@@ -43,6 +43,27 @@ jobs:
         shell: bash
         run: ls -la dist/ | grep -iE '\.exe$' && file dist/*.exe || true
 
+      - name: Publish release ke Print Hub (jika secret HUB_RELEASE_URL di-set)
+        shell: bash
+        env:
+          HUB_URL: ${{ secrets.HUB_RELEASE_URL }}
+          HUB_TOKEN: ${{ secrets.HUB_RELEASE_TOKEN }}
+        run: |
+          if [ -z "${HUB_URL}" ] || [ -z "${HUB_TOKEN}" ]; then
+            echo "HUB_RELEASE_URL/HUB_RELEASE_TOKEN belum di-set — lewati publish"
+            exit 0
+          fi
+          VERSION=$(python -c "import json;print(json.load(open('config.json')).get('version','3.0.0'))")
+          EXE=$(ls dist/*.exe 2>/dev/null | head -1)
+          if [ -z "$EXE" ]; then echo "EXE tidak ditemukan — lewati"; exit 0; fi
+          echo "Publish $EXE v$VERSION ke $HUB_URL"
+          curl -fsS -X POST "${HUB_URL}/api/v1/releases" \
+            -H "X-Release-Token: ${HUB_TOKEN}" \
+            -F "version=${VERSION}" \
+            -F "platform=windows" \
+            -F "channel=stable" \
+            -F "installer_file=@${EXE}"
+
       - name: Build MSI (WiX via build_msi.bat)
         if: steps.wix.outcome == 'success'
         shell: cmd
