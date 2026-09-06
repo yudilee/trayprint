@@ -28,7 +28,7 @@ set WIX_TOOLSET_PATH=
 
 REM ---- Locate WiX candle.exe ----
 where candle.exe >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if not errorlevel 1 (
     set CANDLE=candle.exe
     set LIGHT=light.exe
 ) else if defined WIX_TOOLSET_PATH (
@@ -43,6 +43,8 @@ if %ERRORLEVEL% EQU 0 (
     echo         or set the WIX_TOOLSET_PATH environment variable.
     exit /b 1
 )
+echo CANDLE=%CANDLE%
+echo LIGHT=%LIGHT%
 
 REM ---- Check prerequisites ----
 if not exist "%PROJECT_DIR%dist\trayprint.exe" (
@@ -84,16 +86,18 @@ pushd "%SCRIPT_DIR%"
 
 echo [1/2] Compiling WiX source...
 %CANDLE% -ext WixUtilExtension -dVersion=1.0.0 trayprint.wxs -out trayprint.wixobj
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] WiX compilation failed (candle.exe exit code %ERRORLEVEL%).
+echo [candle rc=!errorlevel!]
+if errorlevel 1 (
+    echo [ERROR] WiX compilation failed (candle.exe exit code !errorlevel!).
     popd
     exit /b 1
 )
 
 echo [2/2] Linking MSI package...
 %LIGHT% -ext WixUtilExtension -ext WixUIExtension -out "TrayPrint.msi" trayprint.wixobj
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] WiX linking failed (light.exe exit code %ERRORLEVEL%).
+echo [light rc=!errorlevel!]
+if errorlevel 1 (
+    echo [ERROR] WiX linking failed (light.exe exit code !errorlevel!).
     popd
     exit /b 1
 )
@@ -103,6 +107,14 @@ echo ===========================================================================
 echo  BUILD SUCCESS!
 echo  Installer: %SCRIPT_DIR%TrayPrint.msi
 echo ===========================================================================
+
+REM Salin ke dist\ supaya masuk artifact workflow (upload glob dist/*.msi)
+if exist "%SCRIPT_DIR%TrayPrint.msi" (
+    copy /y "%SCRIPT_DIR%TrayPrint.msi" "%PROJECT_DIR%dist\TrayPrint.msi" >nul
+    echo Copied MSI to: %PROJECT_DIR%dist\TrayPrint.msi
+) else (
+    echo [WARNING] TrayPrint.msi tidak ditemukan utk disalin ke dist\
+)
 
 popd
 endlocal
