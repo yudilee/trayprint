@@ -57,12 +57,16 @@ jobs:
           EXE=$(ls dist/*.exe 2>/dev/null | head -1)
           if [ -z "$EXE" ]; then echo "EXE tidak ditemukan — lewati"; exit 0; fi
           echo "Publish $EXE v$VERSION ke $HUB_URL"
-          curl -fsS -X POST "${HUB_URL}/api/v1/releases" \
+          CODE=$(curl -sS -o /tmp/publish_resp.json -w '%{http_code}' -X POST "${HUB_URL}/api/v1/releases" \
             -H "X-Release-Token: ${HUB_TOKEN}" \
             -F "version=${VERSION}" \
             -F "platform=windows" \
             -F "channel=stable" \
-            -F "installer_file=@${EXE}"
+            -F "installer_file=@${EXE}")
+          echo "HTTP ${CODE}"
+          head -c 800 /tmp/publish_resp.json || true
+          echo ""
+          if [ "${CODE}" != "201" ]; then exit 1; fi
 
       - name: Build MSI (WiX via build_msi.bat)
         if: steps.wix.outcome == 'success'
