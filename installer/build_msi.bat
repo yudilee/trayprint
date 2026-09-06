@@ -88,7 +88,7 @@ echo [1/2] Compiling WiX source...
 %CANDLE% -ext WixUtilExtension -dVersion=1.0.0 trayprint.wxs -out trayprint.wixobj
 echo [candle rc=!errorlevel!]
 if errorlevel 1 (
-    echo [ERROR] WiX compilation failed (candle.exe exit code !errorlevel!).
+    echo [ERROR] WiX compilation failed - candle rc !errorlevel!.
     popd
     exit /b 1
 )
@@ -97,7 +97,7 @@ echo [2/2] Linking MSI package...
 %LIGHT% -ext WixUtilExtension -ext WixUIExtension -out "TrayPrint.msi" trayprint.wixobj
 echo [light rc=!errorlevel!]
 if errorlevel 1 (
-    echo [ERROR] WiX linking failed (light.exe exit code !errorlevel!).
+    echo [ERROR] WiX linking failed - light rc !errorlevel!.
     popd
     exit /b 1
 )
