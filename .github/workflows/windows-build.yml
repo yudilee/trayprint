@@ -30,18 +30,21 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Install WiX Toolset v3 (untuk MSI)
-        run: choco install wixtoolset --version=3.14.1 -y --no-progress
-
       - name: Build EXE (PyInstaller)
         shell: bash
         run: python build.py
+
+      - name: Install WiX Toolset v3 (untuk MSI)
+        id: wix
+        continue-on-error: true
+        run: choco install wixtoolset -y --no-progress
 
       - name: Verify EXE
         shell: bash
         run: ls -la dist/ | grep -iE '\.exe$' && file dist/*.exe || true
 
       - name: Build MSI (WiX via build_msi.bat)
+        if: steps.wix.outcome == 'success'
         shell: cmd
         run: installer\build_msi.bat
         continue-on-error: true
