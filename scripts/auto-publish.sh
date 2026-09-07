@@ -29,7 +29,7 @@ touch "$STATE_FILE"
 
 API="https://api.github.com/repos/${REPO}"
 AUTH="Authorization: Bearer ${PAT}"
-VERSION=$(python3 -c "import json;print(json.load(open('$REPO_DIR/config.json')).get('version','3.0.0'))")
+VERSION=$(python3 -c "import re;print(re.search(r'APP_VERSION = \"([^\"]+)\"', open('$REPO_DIR/server.py').read()).group(1))")
 log "=== cek publish v${VERSION} ==="
 
 publish_artifact() { # $1=run_id $2=artifact_name $3=platform $4=ext

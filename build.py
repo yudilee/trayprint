@@ -233,6 +233,14 @@ def build():
         '--collect-all=chardet',
     ]
 
+    # Exclude ML/browser bloat yang TIDAK dipakai runtime namun ikut ter-collect
+    # via rantai import tak langsung (mis. sympy -> functorch -> torch/nvidia,
+    # playwright, polars, PyQt5). Menjaga ukuran bundle tetap wajar.
+    for mod in ('torch', 'nvidia', 'triton', 'functorch', 'sympy',
+                'playwright', 'polars', 'pyarrow', 'llvmlite', 'PyQt5',
+                'PyQt6', 'matplotlib', 'scipy', 'pandas', 'numpy'):
+        pyinstaller_flags += ['--exclude-module', mod]
+
     # --windowed is Windows/macOS only; on Linux it suppresses the console
     # which is not the intended behavior (we want stderr visible for diagnostics)
     if sys.platform in ('win32', 'darwin'):
