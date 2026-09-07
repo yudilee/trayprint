@@ -139,7 +139,7 @@ def merge_printer_config(printer_name, options):
              printer_name, base, options, merged)
     return merged
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 
 
 # ─────────────────────────────────────────────
