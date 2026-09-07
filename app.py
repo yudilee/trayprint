@@ -598,6 +598,25 @@ def get_config(config_path_override=None):
 INSTANCE_LOCK_KEY = "TrayPrint_SingleInstance_v3"
 
 
+def _pid_belongs_to_trayprint(pid):
+    """True kalau PID itu memang proses TrayPrint (hindari false-positive
+    dari PID yang sudah di-recycle proses lain)."""
+    try:
+        if sys.platform == 'win32':
+            out = subprocess.check_output(
+                ['tasklist', '/FI', 'PID eq %d' % pid],
+                stderr=subprocess.STDOUT, timeout=10,
+            )
+            return b'trayprint' in out.lower()
+        # POSIX: cek cmdline proses
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            cmd = f.read().decode('utf-8', 'replace')
+        return ('trayprint' in cmd) or ('app.py' in cmd)
+    except Exception:
+        # Tidak bisa diverifikasi — anggap hidup (aman: tolak instance kedua)
+        return True
+
+
 def _check_instance_lock():
     """Try to acquire a lock; return False if another instance is running.
     
@@ -610,24 +629,11 @@ def _check_instance_lock():
         if os.path.exists(pid_path):
             with open(pid_path, 'r') as f:
                 old_pid = int(f.read().strip())
-            # Check if the process with this PID is still alive
-            pid_exists = False
-            if sys.platform == 'win32':
-                import errno
-                try:
-                    os.kill(old_pid, 0)
-                    pid_exists = True
-                except OSError as err:
-                    # EPERM means process exists but we don't have permission to signal it
-                    pid_exists = (err.errno == errno.EPERM)
-            else:
-                pid_exists = os.path.exists(f'/proc/{old_pid}')
-
-            if pid_exists:
+            if _pid_belongs_to_trayprint(old_pid):
                 log.warning("Another TrayPrint instance is already running (PID %d exists)", old_pid)
                 return False
             else:
-                # Stale PID file — clean it up
+                # Stale PID file (proses sudah mati / PID ke-recycle) — bersihkan
                 log.info("Removing stale PID file from previous instance (PID %d)", old_pid)
                 os.remove(pid_path)
         # Write our PID

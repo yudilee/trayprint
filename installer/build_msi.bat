@@ -46,6 +46,13 @@ if not errorlevel 1 (
 echo CANDLE=%CANDLE%
 echo LIGHT=%LIGHT%
 
+REM ---- Ambil versi aplikasi dari server.py (fallback 1.0.0) ----
+set "APP_VERSION=1.0.0"
+if exist "%PROJECT_DIR%\server.py" (
+    for /f "usebackq delims=" %%V in (`python -c "import re;print(re.search(r'APP_VERSION = \x22([^\x22]+)\x22',open(r'%PROJECT_DIR%\server.py').read()).group(1))"`) do set "APP_VERSION=%%V"
+)
+echo APP_VERSION=%APP_VERSION%
+
 REM ---- Check prerequisites ----
 if not exist "%PROJECT_DIR%dist\trayprint.exe" (
     echo [ERROR] dist\trayprint.exe not found.
@@ -85,7 +92,7 @@ echo.
 pushd "%SCRIPT_DIR%"
 
 echo [1/2] Compiling WiX source...
-%CANDLE% -ext WixUtilExtension -dVersion=1.0.0 trayprint.wxs -out trayprint.wixobj
+%CANDLE% -ext WixUtilExtension -dVersion=%APP_VERSION% trayprint.wxs -out trayprint.wixobj
 echo [candle rc=!errorlevel!]
 if errorlevel 1 (
     echo [ERROR] WiX compilation failed - candle rc !errorlevel!.

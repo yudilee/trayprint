@@ -15,6 +15,14 @@ def get_logger():
     _logger = logging.getLogger('trayprint')
     _logger.setLevel(logging.DEBUG)
 
+    # Windows console (cp1252) gagal encode karakter non-ASCII (mis. '→') saat
+    # stdout/stderr di-redirect — paksa errors='replace' supaya tidak crash.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
+
     formatter = logging.Formatter(
         '[%(asctime)s] %(levelname)-7s %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
